@@ -1,0 +1,21 @@
+# Build output
+tanx
+tanx.exe
+*.o
+*.obj
+*.out
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+
+# Runtime-generated sound files (written to the OS temp dir, but just in case)
+*.wav
