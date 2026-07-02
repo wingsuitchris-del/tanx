@@ -15,9 +15,88 @@
 #include <string>
 #include <algorithm>
 #include <filesystem>
+#include <optional>
+#include <cstring>
 
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
+
+// --- Platform-specific socket headers ----------------------------------------
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+   typedef SOCKET SocketHandle;
+#  define INVALID_SOCK INVALID_SOCKET
+#  define SOCK_ERR     SOCKET_ERROR
+   static int NetErrno()        { return WSAGetLastError(); }
+   static bool WouldBlock()     { return WSAGetLastError() == WSAEWOULDBLOCK; }
+   static void CloseSocket(SocketHandle s) { closesocket(s); }
+#else
+#  include <sys/socket.h>
+#  include <netinet/in.h>
+#  include <arpa/inet.h>
+#  include <netdb.h>
+#  include <unistd.h>
+#  include <fcntl.h>
+#  include <errno.h>
+   typedef int SocketHandle;
+#  define INVALID_SOCK (-1)
+#  define SOCK_ERR     (-1)
+   static int  NetErrno()       { return errno; }
+   static bool WouldBlock()     { return errno == EAGAIN || errno == EWOULDBLOCK; }
+   static void CloseSocket(SocketHandle s) { close(s); }
+#endif
+
+static void SetNonBlocking(SocketHandle s) {
+#ifdef _WIN32
+    u_long m = 1; ioctlsocket(s, FIONBIO, &m);
+#else
+    int fl = fcntl(s, F_GETFL, 0); fcntl(s, F_SETFL, fl | O_NONBLOCK);
+#endif
+}
+
+// Returns the best-guess LAN IP for this machine (IPv4)
+static std::string GetLocalIP() {
+    char hostname[256];
+    if (gethostname(hostname, sizeof(hostname)) != 0) return "?.?.?.?";
+    struct addrinfo hints = {}, *res;
+    hints.ai_family = AF_INET;
+    if (getaddrinfo(hostname, nullptr, &hints, &res) != 0) return "?.?.?.?";
+    char ip[INET_ADDRSTRLEN] = {};
+    inet_ntop(AF_INET, &((struct sockaddr_in*)res->ai_addr)->sin_addr, ip, sizeof(ip));
+    freeaddrinfo(res);
+    return std::string(ip);
+}
+
+// --- Network message protocol -----------------------------------------------
+constexpr uint16_t NET_PORT = 7890;
+
+enum class NetMode { NONE, HOST, CLIENT };
+
+enum class NetMsg : uint8_t {
+    MATCH_START  = 1,  // host → client: GameSettings + player names
+    ROUND_START  = 2,  // host → client: terrain array + positions + wind + gravity
+    TURN_ACTION  = 3,  // acting → other: finalX, weapon, angle, power, flags
+    TURN_RESULT  = 4,  // host → client: canonical HP/shields/ammo/pickup/wind
+    DISCONNECT   = 5,
+};
+
+// Helper: write/read primitives into a byte buffer
+struct NetBuf {
+    std::vector<uint8_t> data;
+    void writeU8(uint8_t  v) { data.push_back(v); }
+    void writeI32(int32_t v) { uint32_t n = htonl((uint32_t)v); uint8_t b[4]; memcpy(b,&n,4); data.insert(data.end(),b,b+4); }
+    void writeF32(float   v) { uint32_t n; memcpy(&n,&v,4); n=htonl(n); uint8_t b[4]; memcpy(b,&n,4); data.insert(data.end(),b,b+4); }
+    void writeStr(const std::string& s) { writeU8((uint8_t)s.size()); data.insert(data.end(),s.begin(),s.end()); }
+};
+struct NetReader {
+    const uint8_t* d; size_t pos = 0;
+    uint8_t  readU8()  { return d[pos++]; }
+    int32_t  readI32() { uint32_t n; memcpy(&n,d+pos,4); pos+=4; return (int32_t)ntohl(n); }
+    float    readF32() { uint32_t n; memcpy(&n,d+pos,4); pos+=4; n=ntohl(n); float v; memcpy(&v,&n,4); return v; }
+    std::string readStr() { uint8_t len=readU8(); std::string s((char*)d+pos,len); pos+=len; return s; }
+};
 
 // --- Game constants ---------------------------------------------------------
 
@@ -41,6 +120,7 @@ constexpr int MAX_POWER = 100;
 enum class GameState {
     TITLE,
     MENU,       // Settings screen before the game starts
+    LOBBY,      // Network: choose Host/Join, enter IP, wait for connection
     AIM,
     FIRING,
     EXPLOSION,
@@ -207,6 +287,18 @@ private:
     bool surrendered = false; // true while the GAME_OVER screen is showing a surrender result
     bool drawGame = false;    // true when both tanks die simultaneously or a round times out
     int turnsSinceHit = 0;    // stalemate counter: increments each turn; resets on any hit
+
+    // -- Networking --
+    NetMode       netMode       = NetMode::NONE;
+    SocketHandle  listenSock    = INVALID_SOCK; // host: accept socket
+    SocketHandle  remoteSock    = INVALID_SOCK; // connected peer
+    int           localPlayer   = 0;            // which player index this machine controls
+    bool          netConnected  = false;
+    bool          waitForResult = false;        // client waits for TURN_RESULT after explosion
+    std::string   localIP;
+    std::string   netIPInput;                   // client: typed target IP
+    float         netLobbyBlink = 0;
+    std::vector<uint8_t> recvBuf;              // raw TCP stream buffer
 
     // -- Settings & menu --
     GameSettings settings;
@@ -459,10 +551,245 @@ private:
     }
 
     // =========================================================================
+    // NETWORKING
+    // =========================================================================
+
+    // Send a framed packet: 4-byte header [1 type | 3 length] + payload
+    void NetSend(NetMsg type, const std::vector<uint8_t>& payload) {
+        if (remoteSock == INVALID_SOCK) return;
+        uint32_t header = htonl(((uint32_t)type << 24) | (uint32_t)payload.size());
+        send(remoteSock, (const char*)&header, 4, 0);
+        if (!payload.empty()) send(remoteSock, (const char*)payload.data(), (int)payload.size(), 0);
+    }
+
+    // Drain socket into recvBuf, then extract all complete packets
+    void NetUpdate() {
+        // Accept pending connections (host, waiting phase)
+        if (netMode == NetMode::HOST && listenSock != INVALID_SOCK && remoteSock == INVALID_SOCK) {
+            sockaddr_in ca{}; socklen_t cl = sizeof(ca);
+            SocketHandle c = accept(listenSock, (sockaddr*)&ca, &cl);
+            if (c != INVALID_SOCK) {
+                remoteSock = c;
+                SetNonBlocking(remoteSock);
+                netConnected = true;
+            }
+        }
+        if (remoteSock == INVALID_SOCK) return;
+
+        char chunk[4096];
+        int n = recv(remoteSock, chunk, sizeof(chunk), 0);
+        if (n > 0) {
+            recvBuf.insert(recvBuf.end(), chunk, chunk + n);
+        } else if (n == 0) {
+            NetClose();
+            return;
+        } else if (n < 0 && !WouldBlock()) {
+            NetClose();
+            return;
+        }
+
+        while (recvBuf.size() >= 4) {
+            uint32_t hdr; memcpy(&hdr, recvBuf.data(), 4); hdr = ntohl(hdr);
+            NetMsg type = (NetMsg)(hdr >> 24);
+            uint32_t plen = hdr & 0xFFFFFF;
+            if (recvBuf.size() < 4 + plen) break;
+            std::vector<uint8_t> pkt(recvBuf.begin() + 4, recvBuf.begin() + 4 + plen);
+            recvBuf.erase(recvBuf.begin(), recvBuf.begin() + 4 + plen);
+            NetHandleMessage(type, pkt);
+        }
+    }
+
+    void NetClose() {
+        if (remoteSock != INVALID_SOCK) { CloseSocket(remoteSock); remoteSock = INVALID_SOCK; }
+        if (listenSock != INVALID_SOCK) { CloseSocket(listenSock); listenSock = INVALID_SOCK; }
+        netConnected = false;
+    }
+
+    bool NetStartHost() {
+        listenSock = socket(AF_INET, SOCK_STREAM, 0);
+        if (listenSock == INVALID_SOCK) return false;
+        int yes = 1; setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+        SetNonBlocking(listenSock);
+        sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_port = htons(NET_PORT); addr.sin_addr.s_addr = INADDR_ANY;
+        if (bind(listenSock, (sockaddr*)&addr, sizeof(addr)) < 0) { CloseSocket(listenSock); listenSock = INVALID_SOCK; return false; }
+        listen(listenSock, 1);
+        localPlayer = 0;
+        localIP = GetLocalIP();
+        return true;
+    }
+
+    bool NetConnectToHost(const std::string& ip) {
+        remoteSock = socket(AF_INET, SOCK_STREAM, 0);
+        if (remoteSock == INVALID_SOCK) return false;
+        sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_port = htons(NET_PORT);
+        inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
+        if (connect(remoteSock, (sockaddr*)&addr, sizeof(addr)) < 0 && !WouldBlock()) {
+            CloseSocket(remoteSock); remoteSock = INVALID_SOCK; return false;
+        }
+        SetNonBlocking(remoteSock);
+        localPlayer = 1;
+        netConnected = true;
+        return true;
+    }
+
+    bool IsLocalTurn() const { return netMode == NetMode::NONE || currentPlayer == localPlayer; }
+
+    // ---- Message builders ---------------------------------------------------
+
+    void NetSendMatchStart() {
+        NetBuf b;
+        b.writeStr(settings.playerNames[0]); b.writeStr(settings.playerNames[1]);
+        b.writeU8((uint8_t)settings.windSetting); b.writeU8((uint8_t)settings.gravitySetting);
+        b.writeU8((uint8_t)settings.landscapeSetting); b.writeU8((uint8_t)settings.roundsToWin);
+        b.writeU8((uint8_t)settings.startingHP); b.writeI32(settings.moveBudget);
+        b.writeU8((uint8_t)settings.startAmmoHE); b.writeU8((uint8_t)settings.startAmmoCluster);
+        b.writeU8((uint8_t)settings.startAmmoLaser); b.writeU8((uint8_t)settings.startAmmoBallistics);
+        b.writeU8((uint8_t)settings.startAmmoShield);
+        NetSend(NetMsg::MATCH_START, b.data);
+    }
+
+    void NetSendRoundStart() {
+        NetBuf b;
+        b.writeI32(roundNumber);
+        for (float h : terrain) b.writeF32(h);
+        for (int i = 0; i < 2; i++) { b.writeF32(tanks[i].x); b.writeF32(tanks[i].y); }
+        b.writeF32(wind); b.writeF32(activeGravity);
+        NetSend(NetMsg::ROUND_START, b.data);
+    }
+
+    void NetSendTurnAction(bool skip, bool surrender) {
+        NetBuf b;
+        Tank& t = tanks[currentPlayer];
+        b.writeI32((int32_t)t.x);
+        b.writeU8((uint8_t)selectedWeapon);
+        b.writeI32(t.angle); b.writeI32(t.power);
+        b.writeU8(skip ? 1 : 0); b.writeU8(surrender ? 1 : 0);
+        NetSend(NetMsg::TURN_ACTION, b.data);
+    }
+
+    void NetSendTurnResult() {
+        NetBuf b;
+        for (int i = 0; i < 2; i++) {
+            b.writeI32(tanks[i].hp); b.writeI32(tanks[i].shieldCharges);
+            b.writeU8((uint8_t)tanks[i].ammoHE); b.writeU8((uint8_t)tanks[i].ammoCluster);
+            b.writeU8((uint8_t)tanks[i].ammoLaser); b.writeU8((uint8_t)tanks[i].ammoBallistics);
+            b.writeU8((uint8_t)tanks[i].ammoShield);
+        }
+        for (float h : terrain) b.writeF32(h);
+        b.writeU8(pickup.active ? 1 : 0);
+        if (pickup.active) { b.writeF32(pickup.x); b.writeF32(pickup.y); b.writeU8((uint8_t)pickup.type); }
+        b.writeF32(wind);
+        NetSend(NetMsg::TURN_RESULT, b.data);
+    }
+
+    // ---- Message handlers ---------------------------------------------------
+
+    void NetHandleMessage(NetMsg type, const std::vector<uint8_t>& pkt) {
+        NetReader r{pkt.data()};
+        switch (type) {
+        case NetMsg::MATCH_START: {
+            settings.playerNames[0] = r.readStr(); settings.playerNames[1] = r.readStr();
+            settings.windSetting = r.readU8(); settings.gravitySetting = r.readU8();
+            settings.landscapeSetting = r.readU8(); settings.roundsToWin = r.readU8();
+            settings.startingHP = r.readU8(); settings.moveBudget = r.readI32();
+            settings.startAmmoHE = r.readU8(); settings.startAmmoCluster = r.readU8();
+            settings.startAmmoLaser = r.readU8(); settings.startAmmoBallistics = r.readU8();
+            settings.startAmmoShield = r.readU8();
+            // Reset match-level state on the client
+            tanks[0].score = 0; tanks[1].score = 0;
+            break;
+        }
+        case NetMsg::ROUND_START: {
+            roundNumber = r.readI32();
+            terrain.resize(SCREEN_W);
+            terrainColour.resize(SCREEN_W * GAME_HEIGHT);
+            for (float& h : terrain) h = r.readF32();
+            GenerateTerrainTexture();
+            for (int i = 0; i < 2; i++) { tanks[i].x = r.readF32(); tanks[i].y = r.readF32(); }
+            wind = r.readF32(); activeGravity = r.readF32();
+
+            // Initialise tank stats from the synced match settings
+            for (int i = 0; i < 2; i++) {
+                tanks[i].hp = settings.startingHP;
+                tanks[i].movesLeft = settings.moveBudget;
+                tanks[i].ammoHE = settings.startAmmoHE;
+                tanks[i].ammoCluster = settings.startAmmoCluster;
+                tanks[i].ammoLaser = settings.startAmmoLaser;
+                tanks[i].ammoBallistics = settings.startAmmoBallistics;
+                tanks[i].ammoShield = settings.startAmmoShield;
+                tanks[i].shieldCharges = 0;
+                tanks[i].angle = 45; tanks[i].power = 50;
+            }
+            tanks[0].colour = olc::Pixel(60,140,60);  tanks[0].barrelColour = olc::Pixel(40,100,40);
+            tanks[1].colour = olc::Pixel(160,60,60);  tanks[1].barrelColour = olc::Pixel(120,40,40);
+
+            // Reset all round state
+            projectiles.clear(); explosions.clear(); laserTrail.clear();
+            selectedWeapon = WeaponType::NORMAL; reticleActive = false;
+            currentPlayer = 0; inputMode = InputMode::NONE; inputBuffer.clear();
+            drawGame = false; turnsSinceHit = 0; surrendered = false;
+            pickup.active = false; pickupRespawnTimer = 0; waitForResult = false;
+            SpawnPickup();
+
+            state = GameState::AIM; stateTimer = 0;
+            break;
+        }
+        case NetMsg::TURN_ACTION: {
+            int finalX = r.readI32();
+            selectedWeapon = (WeaponType)r.readU8();
+            int angle = r.readI32(); int power = r.readI32();
+            bool skip = r.readU8() != 0; bool surrender = r.readU8() != 0;
+
+            Tank& t = tanks[currentPlayer];
+            t.x = (float)finalX; t.y = terrain[finalX];
+            t.angle = angle; t.power = power;
+
+            if (surrender) { SurrenderMatch(); }
+            else if (skip) { state = GameState::NEXT_TURN; stateTimer = 0; }
+            else { Fire(); }  // both machines now fire simultaneously
+            break;
+        }
+        case NetMsg::TURN_RESULT: {
+            for (int i = 0; i < 2; i++) {
+                tanks[i].hp = r.readI32(); tanks[i].shieldCharges = r.readI32();
+                tanks[i].ammoHE = r.readU8(); tanks[i].ammoCluster = r.readU8();
+                tanks[i].ammoLaser = r.readU8(); tanks[i].ammoBallistics = r.readU8();
+                tanks[i].ammoShield = r.readU8();
+            }
+            for (float& h : terrain) h = r.readF32();
+            GenerateTerrainTexture();
+            SettleTanks();
+            pickup.active = r.readU8() != 0;
+            if (pickup.active) { pickup.x = r.readF32(); pickup.y = r.readF32(); pickup.type = (PickupType)r.readU8(); }
+            wind = r.readF32();
+            waitForResult = false;
+            // Check win/draw now that canonical state is applied
+            if (tanks[0].hp <= 0 || tanks[1].hp <= 0) {
+                bool both = tanks[0].hp <= 0 && tanks[1].hp <= 0;
+                if (both) drawGame = true;
+                state = GameState::GAME_OVER; stateTimer = 0;
+            } else {
+                state = GameState::NEXT_TURN; stateTimer = 0;
+            }
+            break;
+        }
+        case NetMsg::DISCONNECT:
+            NetClose();
+            ShowPickupMessage("Opponent disconnected.");
+            state = GameState::MENU; stateTimer = 0;
+            break;
+        default: break;
+        }
+    }
+
+    // =========================================================================
     // INITIALISATION
     // =========================================================================
 
     bool OnUserCreate() override {
+#ifdef _WIN32
+        WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
+#endif
         srand((unsigned)time(nullptr));
         roundNumber = 0;
         tanks[0].score = 0;
@@ -881,6 +1208,10 @@ private:
     }
 
     void Fire() {
+        // In network mode, send the action so the remote fires simultaneously
+        if (netMode != NetMode::NONE && IsLocalTurn())
+            NetSendTurnAction(false, false);
+
         if (selectedWeapon == WeaponType::LASER) {
             FireLaser();
             return;
@@ -1334,11 +1665,13 @@ private:
             DrawString(itemX + 28, rowY + 16, items[i].desc, olc::Pixel(180, 180, 180));
         }
 
-        // --- PLAY button ---
-        int btnX = SCREEN_W / 2 - 80;
+        // --- PLAY (local) + NETWORK GAME buttons ---
         int btnY = SCREEN_H - 70;
-        int btnW = 160;
         int btnH = 44;
+
+        // Local play button (left of centre)
+        int btnX = SCREEN_W / 2 - 180;
+        int btnW = 160;
 
         // Button shadow
         FillRect(btnX + 3, btnY + 3, btnW, btnH, olc::Pixel(30, 15, 5));
@@ -1359,17 +1692,37 @@ private:
         olc::Pixel playCol = olc::Pixel(255, (int)(200 + 55 * pulse), (int)(50 * pulse));
         DrawString(btnX + 28, btnY + 10, "PLAY!", playCol, 3);
 
-        // Click on PLAY
+        // Network game button (right of centre)
+        int netBtnX = SCREEN_W / 2 + 20;
+        FillRect(netBtnX + 3, btnY + 3, btnW, btnH, olc::Pixel(20, 30, 50));
+        for (int y = 0; y < btnH; y++) {
+            float t = (float)y / btnH;
+            DrawLine(netBtnX, btnY + y, netBtnX + btnW - 1, btnY + y,
+                olc::Pixel((int)(30-t*10), (int)(80-t*30), (int)(140-t*40)));
+        }
+        DrawRect(netBtnX, btnY, btnW - 1, btnH - 1, olc::Pixel(60, 140, 220));
+        DrawRect(netBtnX + 1, btnY + 1, btnW - 3, btnH - 3, olc::Pixel(40, 100, 180));
+        DrawString(netBtnX + 8, btnY + 10, "NETWORK", olc::Pixel(150, 220, 255), 3);
+
         if (GetMouse(0).bPressed) {
             int mx = GetMouseX(), my = GetMouseY();
-            if (mx >= btnX && mx < btnX + btnW && my >= btnY && my < btnY + btnH) {
-                // Commit any name being edited
+            // Commit name if editing
+            auto commitName = [&]() {
                 if (menuEditingName >= 0) {
                     settings.playerNames[menuEditingName] = menuNameBuffer.empty()
                         ? menuNameBeforeEdit : menuNameBuffer;
                     menuEditingName = -1;
                 }
+            };
+            if (mx >= btnX && mx < btnX + btnW && my >= btnY && my < btnY + btnH) {
+                commitName();
                 StartNewMatch();
+            }
+            if (mx >= netBtnX && mx < netBtnX + btnW && my >= btnY && my < btnY + btnH) {
+                commitName();
+                netMode = NetMode::NONE;
+                NetClose();
+                state = GameState::LOBBY; stateTimer = 0;
             }
         }
     }
@@ -2057,6 +2410,109 @@ private:
     // DRAWING - TITLE & GAME OVER SCREENS
     // =========================================================================
 
+    // =========================================================================
+    // DRAWING - LOBBY SCREEN
+    // =========================================================================
+
+    void DrawLobbyScreen() {
+        DrawWoodPanel(0, 0, SCREEN_W, SCREEN_H);
+        DrawString(SCREEN_W / 2 - 112, 18, "T A N X", olc::Pixel(255, 200, 0), 4);
+        DrawString(SCREEN_W / 2 - 60, 70, "NETWORK GAME", olc::WHITE, 2);
+
+        float pulse = (sin(stateTimer * 3.0f) + 1.0f) * 0.5f;
+        netLobbyBlink += 0.016f;
+
+        if (netMode == NetMode::NONE) {
+            // Mode selection
+            DrawWoodPanel(100, 160, 240, 80);
+            DrawString(150, 185, "HOST GAME", olc::Pixel(100, 255, 100), 2);
+            DrawString(120, 215, "Share your IP to other player", olc::Pixel(180,180,180));
+
+            DrawWoodPanel(460, 160, 240, 80);
+            DrawString(510, 185, "JOIN GAME", olc::Pixel(100, 200, 255), 2);
+            DrawString(480, 215, "Type the host's IP address", olc::Pixel(180,180,180));
+
+            DrawString(SCREEN_W/2 - 40, 500, "ESC = back", olc::Pixel(140,140,140));
+
+            if (GetMouse(0).bPressed) {
+                int mx = GetMouseX(), my = GetMouseY();
+                if (mx >= 100 && mx < 340 && my >= 160 && my < 240) {
+                    if (NetStartHost()) {
+                        netMode = NetMode::HOST;
+                    }
+                }
+                if (mx >= 460 && mx < 700 && my >= 160 && my < 240) {
+                    netMode = NetMode::CLIENT;
+                    netIPInput.clear();
+                }
+            }
+        }
+        else if (netMode == NetMode::HOST) {
+            DrawString(SCREEN_W/2 - 40, 140, "HOST MODE", olc::Pixel(100,255,100), 2);
+            DrawString(SCREEN_W/2 - 80, 200, "Your IP address:", olc::WHITE);
+            DrawString(SCREEN_W/2 - (int)(localIP.length()*12), 230, localIP, olc::YELLOW, 3);
+            DrawString(SCREEN_W/2 - 100, 300, "Give this to the other player.", olc::Pixel(180,180,180));
+
+            if (!netConnected) {
+                std::string waiting = "Waiting for connection...";
+                int alpha = (int)(200 + 55 * pulse);
+                DrawString(SCREEN_W/2 - (int)(waiting.length()*4), 370, waiting, olc::Pixel(100,200,255,alpha));
+            } else {
+                DrawString(SCREEN_W/2 - 72, 370, "Player 2 connected!", olc::Pixel(100,255,100));
+                DrawString(SCREEN_W/2 - 100, 400, "Starting match...", olc::WHITE);
+                // Kick off the match
+                StartNewMatch();
+                NetSendMatchStart();
+                NetSendRoundStart();
+            }
+            DrawString(SCREEN_W/2 - 40, 500, "ESC = cancel", olc::Pixel(140,140,140));
+        }
+        else if (netMode == NetMode::CLIENT) {
+            DrawString(SCREEN_W/2 - 40, 140, "JOIN GAME", olc::Pixel(100,200,255), 2);
+            DrawString(SCREEN_W/2 - 100, 200, "Enter host IP address:", olc::WHITE);
+
+            int fieldX = SCREEN_W/2 - 140, fieldY = 235, fieldW = 280;
+            FillRect(fieldX, fieldY, fieldW, 24, olc::Pixel(20,15,10));
+            DrawRect(fieldX, fieldY, fieldW, 24, olc::Pixel(100,100,255));
+            std::string display = netIPInput;
+            if (fmod(netLobbyBlink, 0.8f) < 0.4f) display += "_";
+            DrawString(fieldX + 6, fieldY + 8, display, olc::Pixel(100,200,255));
+
+            DrawString(SCREEN_W/2 - 60, 290, "ENTER to connect", olc::Pixel(200,200,200));
+            DrawString(SCREEN_W/2 - 40, 500, "ESC = cancel", olc::Pixel(140,140,140));
+
+            if (!netConnected) {
+                DrawString(SCREEN_W/2 - 80, 340, "Connecting...", olc::YELLOW);
+            } else {
+                DrawString(SCREEN_W/2 - 88, 340, "Connected! Waiting for", olc::Pixel(100,255,100));
+                DrawString(SCREEN_W/2 - 64, 360, "host to start...", olc::Pixel(100,255,100));
+            }
+        }
+    }
+
+    // IP input key handling for the lobby join screen (digits + dots only)
+    void UpdateLobbyInput() {
+        if (netMode == NetMode::CLIENT && !netConnected) {
+            int digit = GetDigitPressed();
+            if (digit >= 0 && netIPInput.length() < 15)
+                netIPInput += std::to_string(digit);
+            if (GetKey(olc::Key::PERIOD).bPressed && netIPInput.length() < 15)
+                netIPInput += '.';
+            if (GetKey(olc::Key::BACK).bPressed && !netIPInput.empty())
+                netIPInput.pop_back();
+            if ((GetKey(olc::Key::ENTER).bPressed || GetKey(olc::Key::RETURN).bPressed) && !netIPInput.empty()) {
+                NetConnectToHost(netIPInput);
+            }
+        }
+        if (GetKey(olc::Key::ESCAPE).bPressed) {
+            NetClose();
+            netMode = NetMode::NONE;
+            if (netIPInput.empty()) {
+                state = GameState::MENU; stateTimer = 0;
+            }
+        }
+    }
+
     void DrawTitleScreen() {
         Clear(olc::BLACK);
 
@@ -2142,6 +2598,14 @@ private:
             return true;
         }
 
+        // --- LOBBY SCREEN ---
+        if (state == GameState::LOBBY) {
+            NetUpdate();
+            UpdateLobbyInput();
+            DrawLobbyScreen();
+            return true;
+        }
+
         // --- PICKUPS: ambient clock, respawn timer, message fade, collisions ---
         worldTime += fElapsedTime;
         if (pickupMessageTimer > 0) pickupMessageTimer -= fElapsedTime;
@@ -2151,12 +2615,20 @@ private:
         }
         CheckPickupCollisions();
 
+        // Poll for incoming network messages every frame during active gameplay
+        if (netMode != NetMode::NONE) NetUpdate();
+
+        // If the client is waiting for the host's canonical result, don't advance state
+        if (waitForResult) return true;
+
         Tank& t = tanks[currentPlayer];
 
         // --- AIM PHASE ---
         if (state == GameState::AIM) {
             cursorBlink += fElapsedTime;
             UpdateCheatDetection(fElapsedTime);
+
+            if (IsLocalTurn()) {  // all input handling is inside this guard
 
             if (inputMode != InputMode::NONE) {
                 int digit = GetDigitPressed();
@@ -2210,12 +2682,14 @@ private:
                 }
 
                 if (GetKey(olc::Key::SPACE).bPressed)
-                    Fire();
+                    Fire();  // Fire() sends TURN_ACTION in net mode (see below)
                 if (GetKey(olc::Key::ENTER).bPressed) {
+                    if (netMode != NetMode::NONE) NetSendTurnAction(true, false);
                     state = GameState::NEXT_TURN;
                     stateTimer = 0;
                 }
             }
+            } // end IsLocalTurn() guard
         }
 
         // --- FIRING PHASE: projectile(s) in flight ---
@@ -2310,19 +2784,33 @@ private:
                 SettlePickup();
                 explosions.clear();
 
-                if (tanks[0].hp <= 0 || tanks[1].hp <= 0) {
-                    bool bothDead = (tanks[0].hp <= 0 && tanks[1].hp <= 0);
-                    if (bothDead) {
-                        drawGame = true; // simultaneous kill — nobody wins
-                    } else if (!surrendered) {
-                        int winner = (tanks[0].hp <= 0) ? 1 : 0;
-                        tanks[winner].score++;
+                if (netMode == NetMode::HOST) {
+                    // Host is authoritative: apply outcome, send canonical state to client
+                    if (tanks[0].hp <= 0 || tanks[1].hp <= 0) {
+                        bool bothDead = tanks[0].hp <= 0 && tanks[1].hp <= 0;
+                        if (bothDead) drawGame = true;
+                        else if (!surrendered) { int w = (tanks[0].hp <= 0) ? 1 : 0; tanks[w].score++; }
                     }
-                    state = GameState::GAME_OVER;
+                    NetSendTurnResult();
+                    // Host transitions state immediately; client will transition upon receiving result
+                    if (tanks[0].hp <= 0 || tanks[1].hp <= 0) { state = GameState::GAME_OVER; }
+                    else { state = GameState::NEXT_TURN; }
                     stateTimer = 0;
+                } else if (netMode == NetMode::CLIENT) {
+                    // Client waits for host's TURN_RESULT to get canonical state
+                    waitForResult = true;
                 } else {
-                    state = GameState::NEXT_TURN;
-                    stateTimer = 0;
+                    // Local play — existing logic
+                    if (tanks[0].hp <= 0 || tanks[1].hp <= 0) {
+                        bool bothDead = (tanks[0].hp <= 0 && tanks[1].hp <= 0);
+                        if (bothDead) { drawGame = true; }
+                        else if (!surrendered) { int winner = (tanks[0].hp <= 0) ? 1 : 0; tanks[winner].score++; }
+                        state = GameState::GAME_OVER;
+                        stateTimer = 0;
+                    } else {
+                        state = GameState::NEXT_TURN;
+                        stateTimer = 0;
+                    }
                 }
             }
         }
@@ -2409,6 +2897,18 @@ private:
         DrawPickupMessage();
         DrawUI();
 
+        // Network: overlay "Waiting for..." when it's the remote player's turn or we're awaiting result
+        if (netMode != NetMode::NONE && (!IsLocalTurn() || waitForResult)) {
+            std::string msg = waitForResult
+                ? "Resolving turn..."
+                : "Waiting for " + settings.playerNames[currentPlayer] + "...";
+            float p2 = (sin(stateTimer * 3.0f) + 1.0f) * 0.5f;
+            int bw = (int)msg.length() * 8 + 24;
+            int bx = SCREEN_W/2 - bw/2, by = GAME_TOP + 10;
+            FillRect(bx, by, bw, 20, olc::Pixel(0,0,0,180));
+            DrawString(bx + 12, by + 6, msg, olc::Pixel(200,200,255,(int)(180+75*p2)));
+        }
+
         if (state == GameState::GAME_OVER) {
             DrawGameOverScreen();
             if (GetKey(olc::Key::SPACE).bPressed && stateTimer > 1.0f) {
@@ -2419,6 +2919,7 @@ private:
 
                 if (!drawGame && matchOver) {
                     // Match is decided — return to menu
+                    if (netMode != NetMode::NONE) { NetSend(NetMsg::DISCONNECT, {}); NetClose(); netMode = NetMode::NONE; }
                     state = GameState::MENU;
                     menuEditingName = -1;
                     surrendered = false;
@@ -2426,6 +2927,8 @@ private:
                 } else {
                     // Draw or round win — play the next round
                     NewRound();
+                    // Host syncs the new round to the client
+                    if (netMode == NetMode::HOST) NetSendRoundStart();
                 }
             }
         }
