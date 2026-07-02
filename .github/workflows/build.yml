@@ -6,6 +6,10 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+# Needs write permission to create/update the GitHub Release
+permissions:
+  contents: write
+
 jobs:
   build-windows:
     runs-on: windows-latest
@@ -30,10 +34,13 @@ jobs:
       - name: Build tanx.exe
         run: make
 
-      - name: Upload tanx.exe as a downloadable artifact
-        uses: actions/upload-artifact@v4
+      # Publish (or overwrite) the "latest" release so the download link
+      # never changes — just go to /releases/latest to get the newest build
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
         with:
-          name: tanx-windows
-          path: tanx.exe
-          # Artifact is kept for 90 days
-          retention-days: 90
+          tag_name: latest
+          name: "Latest Build"
+          body: "Automatically built from the latest code on main."
+          prerelease: true
+          files: tanx.exe
