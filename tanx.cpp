@@ -2667,10 +2667,13 @@ private:
         // Poll for incoming network messages every frame during active gameplay
         if (netMode != NetMode::NONE) NetUpdate();
 
-        // If the client is waiting for the host's canonical result, don't advance state
-        if (waitForResult) return true;
-
+        // While waiting for the host's TURN_RESULT we skip all state-machine
+        // logic but still fall through to the render section below, so the
+        // screen shows a clean frame (explosions already cleared from the
+        // vector) instead of freezing on the last rendered frame.
         Tank& t = tanks[currentPlayer];
+
+        if (!waitForResult) { // --- STATE MACHINE (skipped while awaiting TURN_RESULT) ---
 
         // --- AIM PHASE ---
         if (state == GameState::AIM) {
@@ -2919,6 +2922,8 @@ private:
                 stateTimer = 0;
             }
         }
+
+        } // end if (!waitForResult)
 
         // --- RENDER ---
         Clear(olc::BLACK);
