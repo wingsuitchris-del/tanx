@@ -2162,15 +2162,52 @@ private:
         DrawString(midCol, row2, "ROUND:", textCol);
         DrawString(midCol + 56, row2, std::to_string(roundNumber), valCol);
 
-        // Scores (using player names, truncated if long)
-        std::string p1Short = settings.playerNames[0].substr(0, 8);
-        std::string p2Short = settings.playerNames[1].substr(0, 8);
-        DrawString(rightCol, row1, p1Short + ":", olc::Pixel(100, 255, 100));
-        DrawString(rightCol + (int)(p1Short.length() + 1) * 8, row1,
-            std::to_string(tanks[0].score), valCol);
-        DrawString(rightCol, row2, p2Short + ":", olc::Pixel(255, 100, 100));
-        DrawString(rightCol + (int)(p2Short.length() + 1) * 8, row2,
-            std::to_string(tanks[1].score), valCol);
+        // Player panels: name, round-win score, and a segmented HP bar
+        for (int p = 0; p < 2; p++) {
+            int panelY = (p == 0) ? 38 : 63;
+            int panelX = rightCol;
+            int panelW = SCREEN_W - rightCol - 8;
+
+            // Dark background
+            FillRect(panelX, panelY, panelW, 22, olc::Pixel(20, 15, 10));
+            DrawRect(panelX, panelY, panelW - 1, 21,
+                p == 0 ? olc::Pixel(60, 100, 60) : olc::Pixel(100, 60, 60));
+
+            // Name (up to 7 chars)
+            std::string name = settings.playerNames[p].substr(0, 7);
+            olc::Pixel nameCol = (p == 0) ? olc::Pixel(100, 255, 100) : olc::Pixel(255, 100, 100);
+            DrawString(panelX + 4, panelY + 4, name, nameCol);
+
+            // Round wins (top-right of panel)
+            std::string wins = std::to_string(tanks[p].score) + "W";
+            DrawString(panelX + panelW - (int)wins.length() * 8 - 4, panelY + 4, wins, valCol);
+
+            // Segmented HP bar — one pip per HP point
+            int maxHP = settings.startingHP;
+            int curHP = tanks[p].hp;
+            int pipTotalW = panelW - 8;
+            int pipW = (pipTotalW - (maxHP - 1) * 2) / maxHP; // pip width
+            int pipH = 7;
+            int pipY = panelY + 13;
+            for (int h = 0; h < maxHP; h++) {
+                int pipX = panelX + 4 + h * (pipW + 2);
+                bool filled = (h < curHP);
+
+                olc::Pixel fillCol;
+                if (!filled) {
+                    fillCol = olc::Pixel(40, 30, 20); // empty
+                } else if (curHP == 1) {
+                    fillCol = olc::Pixel(220, 40, 40);  // critical — red
+                } else if (curHP <= maxHP / 2) {
+                    fillCol = olc::Pixel(220, 140, 30); // half — orange
+                } else {
+                    fillCol = (p == 0) ? olc::Pixel(60, 200, 60) : olc::Pixel(200, 60, 60); // healthy
+                }
+
+                FillRect(pipX, pipY, pipW, pipH, fillCol);
+                DrawRect(pipX, pipY, pipW, pipH, olc::Pixel(60, 50, 40));
+            }
+        }
 
         // Controls help
         if (inputMode != InputMode::NONE) {
