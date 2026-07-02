@@ -13,7 +13,7 @@ DEPS = $(SRC) olcPixelGameEngine.h miniaudio.h
 ifeq ($(OS),Windows_NT)
     CXX = g++
     CXXFLAGS = -std=c++17 -Wall -O2
-    LDFLAGS = -luser32 -lgdi32 -lopengl32 -lgdiplus -lshlwapi -ldwmapi -lstdc++fs -lws2_32
+    LDFLAGS = -static-libgcc -static-libstdc++ -luser32 -lgdi32 -lopengl32 -lgdiplus -lshlwapi -ldwmapi -lstdc++fs -lws2_32
     LIBS =
     TARGET := tanx.exe
 else
