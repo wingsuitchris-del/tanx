@@ -75,11 +75,12 @@ constexpr uint16_t NET_PORT = 7890;
 enum class NetMode { NONE, HOST, CLIENT };
 
 enum class NetMsg : uint8_t {
-    MATCH_START  = 1,  // host → client: GameSettings + player names
-    ROUND_START  = 2,  // host → client: terrain array + positions + wind + gravity
-    TURN_ACTION  = 3,  // acting → other: finalX, weapon, angle, power, flags
-    TURN_RESULT  = 4,  // host → client: canonical HP/shields/ammo/pickup/wind
-    DISCONNECT   = 5,
+    MATCH_START   = 1,  // host → client: GameSettings + player names
+    ROUND_START   = 2,  // host → client: terrain array + positions + wind + gravity
+    TURN_ACTION   = 3,  // acting → other: finalX, weapon, angle, power, flags
+    TURN_RESULT   = 4,  // host → client: canonical HP/shields/ammo/pickup/wind
+    DISCONNECT    = 5,
+    PLAYER_NAME   = 6,  // client → host: the client's chosen display name
 };
 
 // Helper: write/read primitives into a byte buffer
@@ -297,6 +298,10 @@ private:
     bool          waitForResult = false;        // client waits for TURN_RESULT after explosion
     std::string   localIP;
     std::string   netIPInput;                   // client: typed target IP
+    std::string   netLobbyName;                 // name typed in the lobby before connecting
+    bool          netEditingName = false;        // is the name field active?
+    bool          netReadyToStart = false;       // host: true once client name received
+    bool          netNameSent = false;           // client: has name been sent to host yet?
     float         netLobbyBlink = 0;
     std::vector<uint8_t> recvBuf;              // raw TCP stream buffer
 
@@ -576,6 +581,13 @@ private:
         }
         if (remoteSock == INVALID_SOCK) return;
 
+        // Client: send our name to the host the first time we're connected
+        if (netMode == NetMode::CLIENT && netConnected && !netNameSent) {
+            NetBuf b; b.writeStr(settings.playerNames[1]);
+            NetSend(NetMsg::PLAYER_NAME, b.data);
+            netNameSent = true;
+        }
+
         char chunk[4096];
         int n = recv(remoteSock, chunk, sizeof(chunk), 0);
         if (n > 0) {
@@ -773,6 +785,13 @@ private:
             } else {
                 state = GameState::NEXT_TURN; stateTimer = 0;
             }
+            break;
+        }
+        case NetMsg::PLAYER_NAME: {
+            // Host receives the client's name, stores it, then launches the match
+            NetReader nr{pkt.data()};
+            settings.playerNames[1] = nr.readStr();
+            netReadyToStart = true;
             break;
         }
         case NetMsg::DISCONNECT:
@@ -2422,47 +2441,65 @@ private:
         DrawString(SCREEN_W / 2 - 60, 70, "NETWORK GAME", olc::WHITE, 2);
 
         float pulse = (sin(stateTimer * 3.0f) + 1.0f) * 0.5f;
-        netLobbyBlink += 0.016f;
+        netLobbyBlink += frameTime;
 
+        // --- Name field (always shown, both host and client set their own name) ---
+        DrawString(SCREEN_W/2 - 80, 120, "Your name:", olc::WHITE);
+        int nameX = SCREEN_W/2 - 80, nameY = 135, nameW = 260;
+        bool nameHovered = GetMouseX() >= nameX && GetMouseX() < nameX + nameW
+                        && GetMouseY() >= nameY && GetMouseY() < nameY + 22;
+
+        FillRect(nameX, nameY, nameW, 22, olc::Pixel(20,15,10));
+        DrawRect(nameX, nameY, nameW, 22, netEditingName ? olc::Pixel(255,200,80) : olc::Pixel(80,60,30));
+        std::string nameDisplay = netLobbyName + (netEditingName && fmod(netLobbyBlink, 0.8f) < 0.4f ? "_" : "");
+        DrawString(nameX + 6, nameY + 7, nameDisplay.empty() ? "(click to set your name)" : nameDisplay,
+            netLobbyName.empty() ? olc::Pixel(120,120,120) : olc::YELLOW);
+
+        if (GetMouse(0).bPressed && nameHovered) netEditingName = true;
+        if (GetMouse(0).bPressed && !nameHovered) netEditingName = false;
+
+        // --- Mode panels ---
         if (netMode == NetMode::NONE) {
-            // Mode selection
-            DrawWoodPanel(100, 160, 240, 80);
-            DrawString(150, 185, "HOST GAME", olc::Pixel(100, 255, 100), 2);
-            DrawString(120, 215, "Share your IP to other player", olc::Pixel(180,180,180));
+            DrawWoodPanel(100, 200, 240, 80);
+            DrawString(150, 225, "HOST GAME", olc::Pixel(100, 255, 100), 2);
+            DrawString(120, 255, "Share your IP with other player", olc::Pixel(180,180,180));
 
-            DrawWoodPanel(460, 160, 240, 80);
-            DrawString(510, 185, "JOIN GAME", olc::Pixel(100, 200, 255), 2);
-            DrawString(480, 215, "Type the host's IP address", olc::Pixel(180,180,180));
+            DrawWoodPanel(460, 200, 240, 80);
+            DrawString(510, 225, "JOIN GAME", olc::Pixel(100, 200, 255), 2);
+            DrawString(480, 255, "Type the host's IP address", olc::Pixel(180,180,180));
 
             DrawString(SCREEN_W/2 - 40, 500, "ESC = back", olc::Pixel(140,140,140));
 
-            if (GetMouse(0).bPressed) {
+            if (GetMouse(0).bPressed && !nameHovered) {
                 int mx = GetMouseX(), my = GetMouseY();
-                if (mx >= 100 && mx < 340 && my >= 160 && my < 240) {
-                    if (NetStartHost()) {
-                        netMode = NetMode::HOST;
-                    }
+                if (mx >= 100 && mx < 340 && my >= 200 && my < 280) {
+                    settings.playerNames[0] = netLobbyName.empty() ? "Player 1" : netLobbyName;
+                    if (NetStartHost()) { netMode = NetMode::HOST; netReadyToStart = false; }
                 }
-                if (mx >= 460 && mx < 700 && my >= 160 && my < 240) {
+                if (mx >= 460 && mx < 700 && my >= 200 && my < 280) {
+                    settings.playerNames[1] = netLobbyName.empty() ? "Player 2" : netLobbyName;
                     netMode = NetMode::CLIENT;
                     netIPInput.clear();
+                    netNameSent = false;
                 }
             }
         }
         else if (netMode == NetMode::HOST) {
-            DrawString(SCREEN_W/2 - 40, 140, "HOST MODE", olc::Pixel(100,255,100), 2);
-            DrawString(SCREEN_W/2 - 80, 200, "Your IP address:", olc::WHITE);
-            DrawString(SCREEN_W/2 - (int)(localIP.length()*12), 230, localIP, olc::YELLOW, 3);
-            DrawString(SCREEN_W/2 - 100, 300, "Give this to the other player.", olc::Pixel(180,180,180));
+            DrawString(SCREEN_W/2 - 40, 200, "HOST MODE", olc::Pixel(100,255,100), 2);
+            DrawString(SCREEN_W/2 - 80, 250, "Your IP address:", olc::WHITE);
+            DrawString(SCREEN_W/2 - (int)(localIP.length()*12), 275, localIP, olc::YELLOW, 3);
+            DrawString(SCREEN_W/2 - 100, 345, "Share this with the other player.", olc::Pixel(180,180,180));
 
             if (!netConnected) {
                 std::string waiting = "Waiting for connection...";
-                int alpha = (int)(200 + 55 * pulse);
-                DrawString(SCREEN_W/2 - (int)(waiting.length()*4), 370, waiting, olc::Pixel(100,200,255,alpha));
+                DrawString(SCREEN_W/2 - (int)(waiting.length()*4), 400, waiting,
+                    olc::Pixel(100,200,255,(int)(200+55*pulse)));
+            } else if (!netReadyToStart) {
+                DrawString(SCREEN_W/2 - 88, 400, "Connected! Waiting for", olc::Pixel(100,255,100));
+                DrawString(SCREEN_W/2 - 64, 418, "player name...", olc::Pixel(100,255,100));
             } else {
-                DrawString(SCREEN_W/2 - 72, 370, "Player 2 connected!", olc::Pixel(100,255,100));
-                DrawString(SCREEN_W/2 - 100, 400, "Starting match...", olc::WHITE);
-                // Kick off the match
+                // Both connected and name received — start the match (runs once)
+                DrawString(SCREEN_W/2 - 72, 400, "Starting match...", olc::WHITE);
                 StartNewMatch();
                 NetSendMatchStart();
                 NetSendRoundStart();
@@ -2470,48 +2507,58 @@ private:
             DrawString(SCREEN_W/2 - 40, 500, "ESC = cancel", olc::Pixel(140,140,140));
         }
         else if (netMode == NetMode::CLIENT) {
-            DrawString(SCREEN_W/2 - 40, 140, "JOIN GAME", olc::Pixel(100,200,255), 2);
-            DrawString(SCREEN_W/2 - 100, 200, "Enter host IP address:", olc::WHITE);
+            DrawString(SCREEN_W/2 - 40, 200, "JOIN GAME", olc::Pixel(100,200,255), 2);
+            DrawString(SCREEN_W/2 - 100, 255, "Enter host IP address:", olc::WHITE);
 
-            int fieldX = SCREEN_W/2 - 140, fieldY = 235, fieldW = 280;
+            int fieldX = SCREEN_W/2 - 140, fieldY = 275, fieldW = 280;
+            bool ipHovered = GetMouseX() >= fieldX && GetMouseX() < fieldX+fieldW
+                          && GetMouseY() >= fieldY && GetMouseY() < fieldY+24;
             FillRect(fieldX, fieldY, fieldW, 24, olc::Pixel(20,15,10));
-            DrawRect(fieldX, fieldY, fieldW, 24, olc::Pixel(100,100,255));
-            std::string display = netIPInput;
-            if (fmod(netLobbyBlink, 0.8f) < 0.4f) display += "_";
-            DrawString(fieldX + 6, fieldY + 8, display, olc::Pixel(100,200,255));
+            DrawRect(fieldX, fieldY, fieldW, 24, (!netEditingName) ? olc::Pixel(100,100,255) : olc::Pixel(80,60,30));
+            std::string ipDisplay = netIPInput + ((!netEditingName) && fmod(netLobbyBlink,0.8f)<0.4f ? "_" : "");
+            DrawString(fieldX + 6, fieldY + 8, ipDisplay, olc::Pixel(100,200,255));
+            if (GetMouse(0).bPressed && ipHovered) netEditingName = false;
 
-            DrawString(SCREEN_W/2 - 60, 290, "ENTER to connect", olc::Pixel(200,200,200));
+            DrawString(SCREEN_W/2 - 60, 315, "ENTER to connect", olc::Pixel(200,200,200));
             DrawString(SCREEN_W/2 - 40, 500, "ESC = cancel", olc::Pixel(140,140,140));
 
             if (!netConnected) {
-                DrawString(SCREEN_W/2 - 80, 340, "Connecting...", olc::YELLOW);
+                if (!netIPInput.empty())
+                    DrawString(SCREEN_W/2 - 60, 370, "Connecting...", olc::YELLOW);
             } else {
-                DrawString(SCREEN_W/2 - 88, 340, "Connected! Waiting for", olc::Pixel(100,255,100));
-                DrawString(SCREEN_W/2 - 64, 360, "host to start...", olc::Pixel(100,255,100));
+                DrawString(SCREEN_W/2 - 72, 370, "Connected!", olc::Pixel(100,255,100));
+                DrawString(SCREEN_W/2 - 100, 390, "Waiting for host to start...", olc::Pixel(180,180,180));
             }
         }
     }
 
-    // IP input key handling for the lobby join screen (digits + dots only)
+    // Lobby keyboard input — handles both the name field and the IP field
     void UpdateLobbyInput() {
-        if (netMode == NetMode::CLIENT && !netConnected) {
+        netLobbyBlink += frameTime;
+
+        if (netEditingName) {
+            // Name field is active
+            char letter = GetLetterPressed();
+            if (letter != '\0' && netLobbyName.length() < 16) netLobbyName += letter;
+            if (GetKey(olc::Key::SPACE).bPressed && netLobbyName.length() < 16) netLobbyName += ' ';
+            if (GetKey(olc::Key::BACK).bPressed && !netLobbyName.empty()) netLobbyName.pop_back();
+            if (GetKey(olc::Key::ENTER).bPressed || GetKey(olc::Key::RETURN).bPressed) netEditingName = false;
+        } else if (netMode == NetMode::CLIENT && !netConnected) {
+            // IP field is active
             int digit = GetDigitPressed();
-            if (digit >= 0 && netIPInput.length() < 15)
-                netIPInput += std::to_string(digit);
-            if (GetKey(olc::Key::PERIOD).bPressed && netIPInput.length() < 15)
-                netIPInput += '.';
-            if (GetKey(olc::Key::BACK).bPressed && !netIPInput.empty())
-                netIPInput.pop_back();
-            if ((GetKey(olc::Key::ENTER).bPressed || GetKey(olc::Key::RETURN).bPressed) && !netIPInput.empty()) {
+            if (digit >= 0 && netIPInput.length() < 15) netIPInput += std::to_string(digit);
+            if (GetKey(olc::Key::PERIOD).bPressed && netIPInput.length() < 15) netIPInput += '.';
+            if (GetKey(olc::Key::BACK).bPressed && !netIPInput.empty()) netIPInput.pop_back();
+            if ((GetKey(olc::Key::ENTER).bPressed || GetKey(olc::Key::RETURN).bPressed) && !netIPInput.empty())
                 NetConnectToHost(netIPInput);
-            }
         }
+
         if (GetKey(olc::Key::ESCAPE).bPressed) {
+            if (netEditingName) { netEditingName = false; return; }
             NetClose();
+            netReadyToStart = false; netNameSent = false;
+            if (netMode == NetMode::NONE) { state = GameState::MENU; stateTimer = 0; }
             netMode = NetMode::NONE;
-            if (netIPInput.empty()) {
-                state = GameState::MENU; stateTimer = 0;
-            }
         }
     }
 
