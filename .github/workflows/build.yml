@@ -1,0 +1,39 @@
+name: Build Windows EXE
+
+# Runs on every push to main, or manually from the Actions tab
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2 with MinGW compiler
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            make
+
+      - name: Build tanx.exe
+        run: make
+
+      - name: Upload tanx.exe as a downloadable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tanx-windows
+          path: tanx.exe
+          # Artifact is kept for 90 days
+          retention-days: 90
