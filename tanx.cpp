@@ -1925,6 +1925,38 @@ private:
             playerIdx == 0 ? olc::Pixel(100, 200, 100) : olc::Pixel(200, 100, 100));
     }
 
+    // Damage smoke rising from a tank that is on its last HP.
+    // Uses worldTime to animate puffs cycling upward — no extra state needed.
+    void DrawSmokeEffect(const Tank& t) {
+        if (t.hp != 1) return;
+
+        int cx = (int)t.x;
+        int baseY = (int)(t.y - TANK_HEIGHT - 2); // just above the hull
+
+        const int numPuffs = 6;
+        const float cycle = 1.4f; // seconds for one puff to travel full height
+
+        for (int i = 0; i < numPuffs; i++) {
+            // Stagger puffs evenly across the cycle
+            float phase = fmod(worldTime + i * (cycle / numPuffs), cycle) / cycle;
+
+            float rise   = phase * 44.0f;                         // pixels risen
+            float drift  = sin(worldTime * 1.8f + i * 1.7f) * 5.0f  // gentle wobble
+                         + sin(i * 2.3f) * 3.0f;
+            float radius = 3.0f + phase * 7.0f;                   // grows as it rises
+            uint8_t alpha = (uint8_t)((1.0f - phase) * 180.0f);   // fades out
+
+            int px = cx + (int)drift;
+            int py = baseY - (int)rise;
+
+            // Keep smoke in the game area
+            if (py < GAME_TOP) continue;
+
+            olc::Pixel col(160, 150, 140, alpha); // warm grey smoke
+            FillCircle(px, py, (int)radius, col);
+        }
+    }
+
     // Draws one arc of the shield dome (upper semicircle only) at a given radius
     void DrawShieldArc(int cx, int cy, float radius, olc::Pixel col) {
         int steps = 20;
@@ -2996,6 +3028,7 @@ private:
             if (tanks[i].hp > 0) {
                 DrawTank(tanks[i], i);
                 DrawShield(tanks[i]);
+                DrawSmokeEffect(tanks[i]);
             }
         }
 
