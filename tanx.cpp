@@ -32,8 +32,7 @@ constexpr int TANK_WIDTH = 24;
 constexpr int TANK_HEIGHT = 12;
 constexpr int BARREL_LENGTH = 16;
 constexpr int MAX_POWER = 100;
-constexpr int TANK_MOVE_BUDGET = 40;
-constexpr int TANK_HP = 3;
+// startingHP and moveBudget are now configurable in GameSettings below
 
 // --- Game state machine -----------------------------------------------------
 // TITLE -> MENU -> AIM <-> FIRING -> EXPLOSION -> NEXT_TURN -> AIM ...
@@ -76,6 +75,15 @@ struct GameSettings {
     int gravitySetting = 1;    // 0=Light, 1=Medium, 2=Strong, 3=Random
     int landscapeSetting = 2;  // 0=Mountains, 1=Foothills, 2=Random
     int roundsToWin = 3;       // 1, 3, 5, or 7
+
+    // Per-match gameplay values (configurable from the menu)
+    int startingHP = 3;         // 1-5
+    int moveBudget = 75;        // 20-100 step 10
+    int startAmmoHE = 1;        // 0-5
+    int startAmmoCluster = 2;   // 0-5
+    int startAmmoLaser = 1;     // 0-5
+    int startAmmoBallistics = 1;// 0-5
+    int startAmmoShield = 1;    // 0-5
 };
 
 // --- Data structures --------------------------------------------------------
@@ -124,7 +132,7 @@ struct Explosion {
 
 enum class PickupType {
     MYSTERY, // random ammo refill for one of the special weapons
-    HEALTH   // +1 HP, capped at TANK_HP
+    HEALTH   // +1 HP, capped at settings.startingHP
 };
 
 struct Pickup {
@@ -197,6 +205,8 @@ private:
 
     // -- Surrender --
     bool surrendered = false; // true while the GAME_OVER screen is showing a surrender result
+    bool drawGame = false;    // true when both tanks die simultaneously or a round times out
+    int turnsSinceHit = 0;    // stalemate counter: increments each turn; resets on any hit
 
     // -- Settings & menu --
     GameSettings settings;
@@ -513,8 +523,8 @@ private:
             tanks[i].y = terrain[(int)tanks[i].x];
             tanks[i].angle = 45;
             tanks[i].power = 50;
-            tanks[i].hp = TANK_HP;
-            tanks[i].movesLeft = TANK_MOVE_BUDGET;
+            tanks[i].hp = settings.startingHP;
+            tanks[i].movesLeft = settings.moveBudget;
             tanks[i].shieldCharges = 0;
         }
 
@@ -531,6 +541,8 @@ private:
         currentPlayer = 0;
         inputMode = InputMode::NONE;
         inputBuffer.clear();
+        drawGame = false;
+        turnsSinceHit = 0;
 
         pickup.active = false;
         pickupRespawnTimer = 0;
@@ -551,11 +563,11 @@ private:
         roundNumber = 0;
         for (int i = 0; i < 2; i++) {
             tanks[i].score = 0;
-            tanks[i].ammoHE = 1;
-            tanks[i].ammoCluster = 2;
-            tanks[i].ammoLaser = 1;
-            tanks[i].ammoBallistics = 1;
-            tanks[i].ammoShield = 1;
+            tanks[i].ammoHE = settings.startAmmoHE;
+            tanks[i].ammoCluster = settings.startAmmoCluster;
+            tanks[i].ammoLaser = settings.startAmmoLaser;
+            tanks[i].ammoBallistics = settings.startAmmoBallistics;
+            tanks[i].ammoShield = settings.startAmmoShield;
         }
         NewRound();
     }
@@ -738,13 +750,13 @@ private:
         ShowPickupMessage(settings.playerNames[tankIdx] + " found +1 " + name + " AMMO!");
     }
 
-    // Health pickup grants +1 HP, capped at TANK_HP
+    // Health pickup grants +1 HP, capped at settings.startingHP
     void CollectHealthPickup(int tankIdx) {
         Tank& t = tanks[tankIdx];
-        if (t.hp < TANK_HP) {
+        if (t.hp < settings.startingHP) {
             t.hp++;
             ShowPickupMessage(settings.playerNames[tankIdx] + " found +1 HEALTH! ("
-                + std::to_string(t.hp) + "/" + std::to_string(TANK_HP) + ")");
+                + std::to_string(t.hp) + "/" + std::to_string(settings.startingHP) + ")");
         } else {
             ShowPickupMessage(settings.playerNames[tankIdx] + " found a Health Box (already full!)");
         }
@@ -1015,6 +1027,7 @@ private:
             return true;
         }
         t.hp--;
+        turnsSinceHit = 0; // a hit happened — reset the stalemate counter
         return false;
     }
 
@@ -1124,6 +1137,43 @@ private:
         return false;
     }
 
+    // Spinner row for the Game Settings panel: label on the left, [-] value [+]
+    // on the right. Directly modifies 'value' in place on click. Returns true if changed.
+    bool DrawMenuSpinner(int x, int y, int w, const std::string& label,
+                         int& value, int minVal, int maxVal, olc::Pixel col = olc::WHITE) {
+        DrawString(x + 4, y + 4, label, col);
+
+        int btnW = 16, valW = 24, gap = 2;
+        int rightEdge = x + w - 4;
+        int plusX  = rightEdge - btnW;
+        int valX   = plusX - gap - valW;
+        int minusX = valX - gap - btnW;
+
+        bool hovMinus = GetMouseX() >= minusX && GetMouseX() < minusX + btnW
+                     && GetMouseY() >= y && GetMouseY() < y + 14;
+        bool hovPlus  = GetMouseX() >= plusX  && GetMouseX() < plusX + btnW
+                     && GetMouseY() >= y && GetMouseY() < y + 14;
+
+        FillRect(minusX, y + 1, btnW, 12, hovMinus ? olc::Pixel(120,80,40) : olc::Pixel(80,55,30));
+        DrawRect(minusX, y + 1, btnW, 12, olc::Pixel(160,120,70));
+        DrawString(minusX + 4, y + 3, "-", olc::WHITE);
+
+        FillRect(valX, y + 1, valW, 12, olc::Pixel(20,15,10));
+        DrawRect(valX, y + 1, valW, 12, olc::Pixel(80,60,30));
+        DrawString(valX + 4, y + 3, std::to_string(value), olc::YELLOW);
+
+        FillRect(plusX, y + 1, btnW, 12, hovPlus ? olc::Pixel(120,80,40) : olc::Pixel(80,55,30));
+        DrawRect(plusX, y + 1, btnW, 12, olc::Pixel(160,120,70));
+        DrawString(plusX + 4, y + 3, "+", olc::WHITE);
+
+        bool changed = false;
+        if (GetMouse(0).bPressed) {
+            if (hovMinus && value > minVal) { value--; changed = true; }
+            if (hovPlus  && value < maxVal) { value++; changed = true; }
+        }
+        return changed;
+    }
+
     // =========================================================================
     // DRAWING - MENU SCREEN
     // =========================================================================
@@ -1227,10 +1277,21 @@ private:
             }
         }
 
-        // --- Credits ---
-        DrawString(530, gravY + 30, "Inspired by", olc::Pixel(160, 140, 120));
-        DrawString(530, gravY + 45, "TANX (1991)", olc::Pixel(200, 180, 150));
-        DrawString(530, gravY + 60, "by Gary Roberts", olc::Pixel(160, 140, 120));
+        // --- Game Settings panel (HP, movement, starting ammo) ---
+        int gsY = panelY + 145 + 8;  // just below the Rounds to Win panel
+        int gsH = 131;                // fills to just above the quick guide
+        DrawWoodPanel(520, gsY, 240, gsH);
+        DrawString(530, gsY + 5, "Game Settings:", olc::Pixel(255, 200, 100), 1);
+
+        int sRow = gsY + 20;
+        int sW = 228;
+        DrawMenuSpinner(520, sRow,      sW, "Tank HP",     settings.startingHP,         1, 5);       sRow += 16;
+        DrawMenuSpinner(520, sRow,      sW, "Movement",    settings.moveBudget,         10, 100, olc::Pixel(150,200,255)); sRow += 16;
+        DrawMenuSpinner(520, sRow,      sW, "HI-EXPLO",    settings.startAmmoHE,         0, 9);       sRow += 16;
+        DrawMenuSpinner(520, sRow,      sW, "Cluster",     settings.startAmmoCluster,    0, 9);       sRow += 16;
+        DrawMenuSpinner(520, sRow,      sW, "Laser",       settings.startAmmoLaser,      0, 9);       sRow += 16;
+        DrawMenuSpinner(520, sRow,      sW, "Ballistic",   settings.startAmmoBallistics, 0, 9);       sRow += 16;
+        DrawMenuSpinner(520, sRow,      sW, "Shield",      settings.startAmmoShield,     0, 9);
 
         // --- Quick guide: weapons & pickups primer ---
         int guideY = gravY + 145 + 9; // just below the gravity panel
@@ -1474,7 +1535,7 @@ private:
         // HP bar
         if (t.hp > 0) {
             int barWidth = TANK_WIDTH;
-            int hpWidth = (int)(barWidth * ((float)t.hp / TANK_HP));
+            int hpWidth = (int)(barWidth * ((float)t.hp / settings.startingHP));
             int barY = bodyTop - 8;
             FillRect(tx - barWidth / 2, barY, barWidth, 3, olc::Pixel(60, 0, 0));
             FillRect(tx - barWidth / 2, barY, hpWidth, 3, olc::Pixel(0, 200, 0));
@@ -1642,6 +1703,7 @@ private:
 
         // Angle (with +/- buttons and type-in support)
         bool amHeld = false, apHeld = false, pmHeld = false, ppHeld = false;
+        bool mlHeld = false, mrHeld = false; // movement left/right click buttons
 
         DrawString(leftCol, row1, "ANGLE:", textCol);
         if (inputMode == InputMode::TYPING_ANGLE) {
@@ -1673,14 +1735,36 @@ private:
             ppHeld = DrawHudButton(leftCol + 110, row2 - 3, "+");
         }
 
-        // Apply mouse button clicks with repeat throttling
+        // Moves — [<] remaining [>] click buttons, greyed when budget is exhausted
+        // Drawn BEFORE RepeatTick so mlHeld/mrHeld are captured in time this frame
+        DrawString(leftCol, row3, "MOVES:", textCol);
+        bool moveDisabled = (t.movesLeft <= 0 || state != GameState::AIM || inputMode != InputMode::NONE);
+        if (!moveDisabled) {
+            mlHeld = DrawHudButton(leftCol + 56, row3 - 3, "<");
+            FillRect(leftCol + 78, row3 - 2, 30, 14, olc::Pixel(20, 15, 10));
+            DrawString(leftCol + 80, row3 + 1, std::to_string(t.movesLeft), valCol);
+            mrHeld = DrawHudButton(leftCol + 110, row3 - 3, ">");
+        } else {
+            FillRect(leftCol + 56, row3 - 2, 73, 14, olc::Pixel(30, 20, 10));
+            DrawString(leftCol + 80, row3 + 1, std::to_string(t.movesLeft), olc::Pixel(100,100,100));
+        }
+
+        // Apply all mouse button clicks with repeat throttling
         if (state == GameState::AIM && inputMode == InputMode::NONE) {
-            bool anyBtnHeld = amHeld || apHeld || pmHeld || ppHeld;
+            bool anyBtnHeld = amHeld || apHeld || pmHeld || ppHeld || mlHeld || mrHeld;
             if (RepeatTick(anyBtnHeld, frameTime, mouseRepeatTimer)) {
                 if (amHeld) t.angle = std::max(0, t.angle - 1);
                 if (apHeld) t.angle = std::min(110, t.angle + 1);
                 if (pmHeld) t.power = std::max(5, t.power - 1);
                 if (ppHeld) t.power = std::min(MAX_POWER, t.power + 1);
+                if (mlHeld && t.movesLeft > 0) {
+                    int newX = (int)t.x - 1;
+                    if (newX > TANK_WIDTH / 2) { t.x = (float)newX; t.y = terrain[newX]; t.movesLeft--; }
+                }
+                if (mrHeld && t.movesLeft > 0) {
+                    int newX = (int)t.x + 1;
+                    if (newX < SCREEN_W - TANK_WIDTH / 2) { t.x = (float)newX; t.y = terrain[newX]; t.movesLeft--; }
+                }
             }
         }
 
@@ -1691,10 +1775,6 @@ private:
         FillRect(barX, row2 - 1, (int)(barW * t.power / 100.0f), 9,
             olc::Pixel(200, 50 + t.power, 50));
         DrawRect(barX, row2 - 1, barW, 9, olc::Pixel(150, 150, 150));
-
-        // Moves
-        DrawString(leftCol, row3, "MOVES:", textCol);
-        DrawString(leftCol + 56, row3, std::to_string(t.movesLeft), valCol);
 
         // Wind
         DrawString(midCol, row1, "WIND:", textCol);
@@ -1993,13 +2073,20 @@ private:
     }
 
     void DrawGameOverScreen() {
-        int winner = tanks[0].hp <= 0 ? 1 : 0;
-        bool matchOver = (tanks[winner].score >= settings.roundsToWin);
+        // Determine winner safely — if both are dead it's a draw
+        int winner = (tanks[0].hp <= 0 && tanks[1].hp > 0) ? 1 :
+                     (tanks[1].hp <= 0 && tanks[0].hp > 0) ? 0 : -1;
+        bool matchOver = (winner >= 0 && tanks[winner].score >= settings.roundsToWin);
 
         FillRect(SCREEN_W / 2 - 200, SCREEN_H / 2 - 80, 400, 160, olc::Pixel(0, 0, 0, 200));
         DrawRect(SCREEN_W / 2 - 200, SCREEN_H / 2 - 80, 400, 160, olc::YELLOW);
 
-        if (surrendered) {
+        if (drawGame) {
+            DrawString(SCREEN_W / 2 - 72, SCREEN_H / 2 - 60, "IT'S A DRAW!", olc::Pixel(200, 200, 100), 2);
+            DrawString(SCREEN_W / 2 - 80, SCREEN_H / 2 - 30,
+                turnsSinceHit >= 30 ? "30 turns without a hit" : "Both tanks destroyed!",
+                olc::Pixel(180, 180, 180));
+        } else if (surrendered) {
             std::string loseText = settings.playerNames[1 - winner] + " SURRENDERED";
             DrawString(SCREEN_W / 2 - (int)(loseText.length() * 4), SCREEN_H / 2 - 60, loseText,
                 olc::Pixel(200, 200, 200));
@@ -2025,7 +2112,7 @@ private:
         DrawString(SCREEN_W / 2 - (int)(scoreText.length() * 4 * 2), SCREEN_H / 2, scoreText, olc::WHITE, 2);
 
         float pulse = (sin(stateTimer * 3.0f) + 1.0f) * 0.5f;
-        std::string prompt = matchOver ? "SPACE for menu" : "SPACE for next round";
+        std::string prompt = (drawGame || !matchOver) ? "SPACE for next round" : "SPACE for menu";
         DrawString(SCREEN_W / 2 - (int)(prompt.length() * 4), SCREEN_H / 2 + 40, prompt,
             olc::Pixel((int)(255 * pulse), (int)(255 * pulse), 0));
     }
@@ -2224,8 +2311,10 @@ private:
                 explosions.clear();
 
                 if (tanks[0].hp <= 0 || tanks[1].hp <= 0) {
-                    // Either a direct hit or a surrender can zero out a tank's HP
-                    if (!surrendered) {
+                    bool bothDead = (tanks[0].hp <= 0 && tanks[1].hp <= 0);
+                    if (bothDead) {
+                        drawGame = true; // simultaneous kill — nobody wins
+                    } else if (!surrendered) {
                         int winner = (tanks[0].hp <= 0) ? 1 : 0;
                         tanks[winner].score++;
                     }
@@ -2257,7 +2346,7 @@ private:
         if (state == GameState::NEXT_TURN) {
             if (stateTimer > 0.5f) {
                 currentPlayer = 1 - currentPlayer;
-                tanks[currentPlayer].movesLeft = TANK_MOVE_BUDGET;
+                tanks[currentPlayer].movesLeft = settings.moveBudget;
                 inputMode = InputMode::NONE;
                 inputBuffer.clear();
                 selectedWeapon = WeaponType::NORMAL;
@@ -2279,6 +2368,16 @@ private:
                     wind += ((rand() % 100) - 50) / 20.0f;
                     wind = std::clamp(wind, -activeWindMax, activeWindMax);
                 }
+
+                // Stalemate check: if 30 turns pass with no hit, declare a draw
+                turnsSinceHit++;
+                if (turnsSinceHit >= 30) {
+                    drawGame = true;
+                    state = GameState::GAME_OVER;
+                    stateTimer = 0;
+                    return true;
+                }
+
                 state = GameState::AIM;
                 stateTimer = 0;
             }
@@ -2313,14 +2412,19 @@ private:
         if (state == GameState::GAME_OVER) {
             DrawGameOverScreen();
             if (GetKey(olc::Key::SPACE).bPressed && stateTimer > 1.0f) {
-                int winner = tanks[0].hp <= 0 ? 1 : 0;
-                if (tanks[winner].score >= settings.roundsToWin) {
-                    // Match over — return to menu
+                // Determine if the match is truly over (a winner has enough round wins)
+                int winner = (tanks[0].hp > 0 && tanks[1].hp <= 0) ? 0 :
+                             (tanks[1].hp > 0 && tanks[0].hp <= 0) ? 1 : -1;
+                bool matchOver = (winner >= 0 && tanks[winner].score >= settings.roundsToWin);
+
+                if (!drawGame && matchOver) {
+                    // Match is decided — return to menu
                     state = GameState::MENU;
                     menuEditingName = -1;
                     surrendered = false;
                     stateTimer = 0;
                 } else {
+                    // Draw or round win — play the next round
                     NewRound();
                 }
             }
