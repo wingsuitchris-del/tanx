@@ -671,6 +671,7 @@ private:
         NetBuf b;
         for (int i = 0; i < 2; i++) {
             b.writeI32(tanks[i].hp); b.writeI32(tanks[i].shieldCharges);
+            b.writeI32(tanks[i].score);
             b.writeU8((uint8_t)tanks[i].ammoHE); b.writeU8((uint8_t)tanks[i].ammoCluster);
             b.writeU8((uint8_t)tanks[i].ammoLaser); b.writeU8((uint8_t)tanks[i].ammoBallistics);
             b.writeU8((uint8_t)tanks[i].ammoShield);
@@ -752,6 +753,7 @@ private:
         case NetMsg::TURN_RESULT: {
             for (int i = 0; i < 2; i++) {
                 tanks[i].hp = r.readI32(); tanks[i].shieldCharges = r.readI32();
+                tanks[i].score = r.readI32();
                 tanks[i].ammoHE = r.readU8(); tanks[i].ammoCluster = r.readU8();
                 tanks[i].ammoLaser = r.readU8(); tanks[i].ammoBallistics = r.readU8();
                 tanks[i].ammoShield = r.readU8();
