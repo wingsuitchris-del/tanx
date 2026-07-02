@@ -758,7 +758,11 @@ private:
             t.angle = angle; t.power = power;
 
             if (surrender) { SurrenderMatch(); }
-            else if (skip) { state = GameState::NEXT_TURN; stateTimer = 0; }
+            else if (skip) {
+                // HOST received skip from CLIENT: send canonical state back then advance
+                if (netMode == NetMode::HOST) { NetSendTurnResult(); }
+                state = GameState::NEXT_TURN; stateTimer = 0;
+            }
             else { Fire(); }  // both machines now fire simultaneously
             break;
         }
@@ -2773,9 +2777,16 @@ private:
                 if (GetKey(olc::Key::SPACE).bPressed)
                     Fire();  // Fire() sends TURN_ACTION in net mode (see below)
                 if (GetKey(olc::Key::ENTER).bPressed) {
-                    if (netMode != NetMode::NONE) NetSendTurnAction(true, false);
-                    state = GameState::NEXT_TURN;
-                    stateTimer = 0;
+                    if (netMode == NetMode::NONE) {
+                        state = GameState::NEXT_TURN; stateTimer = 0;
+                    } else if (netMode == NetMode::HOST) {
+                        NetSendTurnAction(true, false);
+                        NetSendTurnResult();
+                        state = GameState::NEXT_TURN; stateTimer = 0;
+                    } else { // CLIENT acting: tell host, then wait for result
+                        NetSendTurnAction(true, false);
+                        waitForResult = true;
+                    }
                 }
             }
             } // end IsLocalTurn() guard
@@ -2848,8 +2859,14 @@ private:
             for (auto& p : projectiles) if (p.active) anyActive = true;
 
             if (!anyActive) {
-                state = explosions.empty() ? GameState::NEXT_TURN : GameState::EXPLOSION;
-                stateTimer = 0;
+                if (!explosions.empty()) {
+                    state = GameState::EXPLOSION; stateTimer = 0;
+                } else {
+                    // Miss — no explosion to trigger TURN_RESULT, sync ammo manually
+                    if (netMode == NetMode::HOST) { NetSendTurnResult(); state = GameState::NEXT_TURN; stateTimer = 0; }
+                    else if (netMode == NetMode::CLIENT) { waitForResult = true; }
+                    else { state = GameState::NEXT_TURN; stateTimer = 0; }
+                }
             }
         }
 
@@ -2909,13 +2926,19 @@ private:
             if (stateTimer > 0.5f) {
                 laserTrail.clear();
                 int opponent = 1 - currentPlayer;
-                if (tanks[opponent].hp <= 0) {
-                    tanks[currentPlayer].score++;
-                    state = GameState::GAME_OVER;
+                bool killed = (tanks[opponent].hp <= 0);
+                if (killed && !surrendered) tanks[currentPlayer].score++;
+
+                if (netMode == NetMode::HOST) {
+                    NetSendTurnResult();
+                    state = killed ? GameState::GAME_OVER : GameState::NEXT_TURN;
+                    stateTimer = 0;
+                } else if (netMode == NetMode::CLIENT) {
+                    waitForResult = true; // TURN_RESULT will set state
                 } else {
-                    state = GameState::NEXT_TURN;
+                    state = killed ? GameState::GAME_OVER : GameState::NEXT_TURN;
+                    stateTimer = 0;
                 }
-                stateTimer = 0;
             }
         }
 
