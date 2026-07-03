@@ -108,15 +108,20 @@ make
 The easiest path is [MSYS2](https://www.msys2.org/) with the MinGW-w64
 toolchain:
 
-1. Install MSYS2, then from an MSYS2 **MinGW64** shell:
+1. Download and install MSYS2 from https://www.msys2.org/
+2. Open the **MSYS2 UCRT64** shell (find it in the Start menu)
+3. Install the compiler and make:
    ```sh
-   pacman -S mingw-w64-x86_64-gcc make
+   pacman -S mingw-w64-ucrt-x86_64-gcc make
    ```
-2. From the project folder:
+4. Navigate to the project folder and build:
    ```sh
    make
    ./tanx.exe
    ```
+
+> **Note:** make sure you open the **UCRT64** shell specifically — other MSYS2
+> shells use different package names and may not find the compiler.
 
 No libpng is needed on Windows — the engine uses the built-in GDI+ instead.
 
