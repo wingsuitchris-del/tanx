@@ -296,6 +296,9 @@ private:
     int           localPlayer   = 0;            // which player index this machine controls
     bool          netConnected  = false;
     bool          waitForResult = false;        // client waits for TURN_RESULT after explosion
+    bool          hasPendingResult = false;     // TURN_RESULT arrived mid-animation; apply when ready
+    std::vector<uint8_t> pendingResultData;    // buffered TURN_RESULT payload
+    float         nextWind = 0;               // HOST pre-computes next wind; CLIENT reads from TURN_RESULT
     std::string   localIP;
     std::string   netIPInput;                   // client: typed target IP
     std::string   netLobbyName;                 // name typed in the lobby before connecting
@@ -699,6 +702,17 @@ private:
     // Returns true when it is this machine's player's turn to act
     bool IsLocalTurn() const { return netMode == NetMode::NONE || currentPlayer == localPlayer; }
 
+    // Mark the CLIENT as ready to receive the HOST's canonical state.
+    // If a TURN_RESULT arrived early (mid-animation) it was buffered — flush it now.
+    void SetWaitForResult() {
+        SetWaitForResult();
+        if (hasPendingResult) {
+            std::vector<uint8_t> saved = pendingResultData;
+            hasPendingResult = false; pendingResultData.clear();
+            NetHandleMessage(NetMsg::TURN_RESULT, saved);
+        }
+    }
+
     // ---- Message builders ---------------------------------------------------
     // Each function serialises a specific message payload into a NetBuf and
     // calls NetSend(). All values use network byte order (big-endian).
@@ -727,6 +741,10 @@ private:
         for (float h : terrain) b.writeF32(h);  // 800 × 4 bytes = 3,200 bytes
         for (int i = 0; i < 2; i++) { b.writeF32(tanks[i].x); b.writeF32(tanks[i].y); }
         b.writeF32(wind); b.writeF32(activeGravity);
+        // Send initial pickup state so the CLIENT does NOT call SpawnPickup()
+        // with its own rand() — that would produce a different position/type.
+        b.writeU8(pickup.active ? 1 : 0);
+        if (pickup.active) { b.writeF32(pickup.x); b.writeF32(pickup.y); b.writeU8((uint8_t)pickup.type); }
         NetSend(NetMsg::ROUND_START, b.data);
     }
 
@@ -751,6 +769,15 @@ private:
     // Terrain is re-sent in full after every explosion so crater damage stays
     // pixel-identical on both machines.
     void NetSendTurnResult() {
+        // HOST pre-computes the wind for the NEXT turn here so the CLIENT uses
+        // the exact same value. Without this both machines call rand() independently
+        // in NEXT_TURN and the wind diverges, causing different projectile paths.
+        nextWind = wind;
+        if (activeWindMax > 0) {
+            nextWind += ((rand() % 100) - 50) / 20.0f;
+            nextWind = std::clamp(nextWind, -activeWindMax, activeWindMax);
+        }
+
         NetBuf b;
         for (int i = 0; i < 2; i++) {
             b.writeI32(tanks[i].hp); b.writeI32(tanks[i].shieldCharges);
@@ -759,10 +786,10 @@ private:
             b.writeU8((uint8_t)tanks[i].ammoLaser); b.writeU8((uint8_t)tanks[i].ammoBallistics);
             b.writeU8((uint8_t)tanks[i].ammoShield);
         }
-        for (float h : terrain) b.writeF32(h);  // terrain after any crater carved this turn
+        for (float h : terrain) b.writeF32(h);
         b.writeU8(pickup.active ? 1 : 0);
         if (pickup.active) { b.writeF32(pickup.x); b.writeF32(pickup.y); b.writeU8((uint8_t)pickup.type); }
-        b.writeF32(wind);  // wind value for the next turn
+        b.writeF32(nextWind);  // authoritative wind for the NEXT turn — CLIENT must use this
         NetSend(NetMsg::TURN_RESULT, b.data);
     }
 
@@ -817,8 +844,11 @@ private:
             selectedWeapon = WeaponType::NORMAL; reticleActive = false;
             currentPlayer = 0; inputMode = InputMode::NONE; inputBuffer.clear();
             drawGame = false; turnsSinceHit = 0; surrendered = false;
-            pickup.active = false; pickupRespawnTimer = 0; waitForResult = false;
-            SpawnPickup();
+            // Read the HOST's pickup state directly — do NOT call SpawnPickup()
+            // here as it uses rand() and would produce a different position/type.
+            pickup.active = r.readU8() != 0;
+            if (pickup.active) { pickup.x = r.readF32(); pickup.y = r.readF32(); pickup.type = (PickupType)r.readU8(); pickup.y = terrain[(int)pickup.x]; }
+            pickupRespawnTimer = 0; hasPendingResult = false; waitForResult = false;
 
             state = GameState::AIM; stateTimer = 0;
             break;
@@ -828,14 +858,22 @@ private:
         // The remote applies the final position, angle, power and weapon then
         // calls Fire() (or handles skip/surrender). Both machines now run the
         // exact same physics from the same starting state — simultaneous fire.
+        //
+        // Guard: if we are not in AIM state the game is mid-simulation and we
+        // cannot safely start a new shot. This can happen if the HOST fires
+        // immediately after a very short NEXT_TURN pause and the packet races
+        // the CLIENT's state transition. Drop and let the state machine catch up
+        // — this case should not occur in normal play with the 0.5s pause.
         case NetMsg::TURN_ACTION: {
+            if (state != GameState::AIM) break;
+
             int finalX = r.readI32();
             selectedWeapon = (WeaponType)r.readU8();
             int angle = r.readI32(); int power = r.readI32();
             bool skip = r.readU8() != 0; bool surrender = r.readU8() != 0;
 
             Tank& t = tanks[currentPlayer];
-            t.x = (float)finalX; t.y = terrain[finalX];
+            t.x = (float)finalX; t.y = terrain[std::clamp(finalX, 0, SCREEN_W - 1)];
             t.angle = angle; t.power = power;
 
             if (surrender) { SurrenderMatch(); }
@@ -849,10 +887,24 @@ private:
         }
 
         // CLIENT receives: apply the HOST's authoritative end-of-turn snapshot.
-        // Overwrites HP, shields, ammo, scores, terrain and pickup state so any
+        // Overwrites HP, shields, ammo, scores, terrain, pickup and wind so any
         // tiny divergence accumulated during simulation is corrected before the
         // next turn. Clears waitForResult to unblock the CLIENT state machine.
+        //
+        // If TURN_RESULT arrives while the CLIENT's own animation is still
+        // running (FIRING/EXPLOSION/LASER_FIRE) — which happens when the HOST
+        // resolves the shot faster than the CLIENT's local sim — we buffer the
+        // packet and re-process it once the CLIENT's animation completes
+        // naturally. This avoids the "projectile frozen for a few frames" bug.
         case NetMsg::TURN_RESULT: {
+            if (netMode == NetMode::CLIENT &&
+                (state == GameState::FIRING || state == GameState::EXPLOSION
+                 || state == GameState::LASER_FIRE) && !waitForResult) {
+                hasPendingResult = true;
+                pendingResultData = pkt;
+                break;
+            }
+            // Apply the snapshot
             for (int i = 0; i < 2; i++) {
                 tanks[i].hp = r.readI32(); tanks[i].shieldCharges = r.readI32();
                 tanks[i].score = r.readI32();
@@ -862,11 +914,14 @@ private:
             }
             for (float& h : terrain) h = r.readF32();
             GenerateTerrainTexture();
-            SettleTanks();
+            SettleTanks(); SettlePickup();
             pickup.active = r.readU8() != 0;
             if (pickup.active) { pickup.x = r.readF32(); pickup.y = r.readF32(); pickup.type = (PickupType)r.readU8(); }
-            wind = r.readF32();
-            waitForResult = false;
+            nextWind = r.readF32();   // authoritative wind for the next turn
+            wind = nextWind;
+            // Clear any stale mid-flight projectiles / animations
+            projectiles.clear(); explosions.clear(); laserTrail.clear();
+            waitForResult = false; hasPendingResult = false;
             if (tanks[0].hp <= 0 || tanks[1].hp <= 0) {
                 bool both = tanks[0].hp <= 0 && tanks[1].hp <= 0;
                 if (both) drawGame = true;
@@ -2820,7 +2875,10 @@ private:
             pickupRespawnTimer -= fElapsedTime;
             if (pickupRespawnTimer <= 0) SpawnPickup();
         }
-        CheckPickupCollisions();
+        // Only the acting player's machine runs pickup collection.
+        // CollectMysteryPickup() calls rand() — if both machines ran it they
+        // would grant different weapons. The HOST's canonical result is what matters.
+        if (IsLocalTurn()) CheckPickupCollisions();
 
         // Poll for incoming network messages every frame during active gameplay
         if (netMode != NetMode::NONE) NetUpdate();
@@ -2902,7 +2960,7 @@ private:
                         state = GameState::NEXT_TURN; stateTimer = 0;
                     } else { // CLIENT acting: tell host, then wait for result
                         NetSendTurnAction(true, false);
-                        waitForResult = true;
+                        SetWaitForResult();
                     }
                 }
             }
@@ -2981,7 +3039,7 @@ private:
                 } else {
                     // Miss — no explosion to trigger TURN_RESULT, sync ammo manually
                     if (netMode == NetMode::HOST) { NetSendTurnResult(); state = GameState::NEXT_TURN; stateTimer = 0; }
-                    else if (netMode == NetMode::CLIENT) { waitForResult = true; }
+                    else if (netMode == NetMode::CLIENT) { SetWaitForResult(); }
                     else { state = GameState::NEXT_TURN; stateTimer = 0; }
                 }
             }
@@ -3021,7 +3079,7 @@ private:
                     stateTimer = 0;
                 } else if (netMode == NetMode::CLIENT) {
                     // Client waits for host's TURN_RESULT to get canonical state
-                    waitForResult = true;
+                    SetWaitForResult();
                 } else {
                     // Local play — existing logic
                     if (tanks[0].hp <= 0 || tanks[1].hp <= 0) {
@@ -3051,7 +3109,7 @@ private:
                     state = killed ? GameState::GAME_OVER : GameState::NEXT_TURN;
                     stateTimer = 0;
                 } else if (netMode == NetMode::CLIENT) {
-                    waitForResult = true; // TURN_RESULT will set state
+                    SetWaitForResult(); // TURN_RESULT will set state
                 } else {
                     state = killed ? GameState::GAME_OVER : GameState::NEXT_TURN;
                     stateTimer = 0;
@@ -3080,10 +3138,17 @@ private:
                     else
                         ShowPickupMessage(settings.playerNames[currentPlayer] + "'s shield fades away!");
                 }
-                // Wind shifts slightly, respecting the configured max
-                if (activeWindMax > 0) {
-                    wind += ((rand() % 100) - 50) / 20.0f;
-                    wind = std::clamp(wind, -activeWindMax, activeWindMax);
+                // Wind for the next turn:
+                // HOST already computed nextWind in NetSendTurnResult() and the CLIENT
+                // received it via TURN_RESULT — both machines use the same value.
+                // In network mode the local rand() call is skipped entirely.
+                if (netMode == NetMode::NONE) {
+                    if (activeWindMax > 0) {
+                        wind += ((rand() % 100) - 50) / 20.0f;
+                        wind = std::clamp(wind, -activeWindMax, activeWindMax);
+                    }
+                } else {
+                    wind = nextWind; // apply the synced value from TURN_RESULT
                 }
 
                 // Stalemate check: if 30 turns pass with no hit, declare a draw
