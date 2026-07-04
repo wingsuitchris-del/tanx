@@ -558,8 +558,52 @@ private:
     // =========================================================================
     // NETWORKING
     // =========================================================================
+    //
+    // Architecture overview
+    // ---------------------
+    // One machine is the HOST (always Player 1) and one is the CLIENT (Player 2).
+    // The HOST is authoritative: it runs the game simulation, resolves outcomes,
+    // and sends the canonical state to the CLIENT after every turn.
+    //
+    // Roles:
+    //   HOST  — generates terrain, resolves physics, sends TURN_RESULT
+    //   CLIENT — receives state, mirrors simulation locally for smooth display
+    //
+    // Simultaneous fire (no lag on LAN)
+    // -----------------------------------
+    // When a player fires, TURN_ACTION is sent immediately. Both machines then
+    // run the same physics simulation at the same time. Because angle, power,
+    // wind and gravity are identical on both, the projectile follows the same
+    // path on both screens without waiting for the network.
+    // After the turn resolves, the HOST sends TURN_RESULT so the CLIENT snaps
+    // to the authoritative state — correcting any tiny float drift.
+    //
+    // waitForResult flag
+    // ------------------
+    // After any turn ends the CLIENT sets waitForResult = true. This blocks
+    // the state machine (but keeps rendering) until TURN_RESULT arrives and
+    // clears the flag. This ensures the CLIENT never advances to the next turn
+    // with stale ammo / HP / terrain.
+    //
+    // Terrain sync
+    // ------------
+    // The HOST generates terrain with rand() which would differ on another
+    // platform/compiler with the same seed. Instead the HOST sends all 800
+    // height floats (~3 KB) to the CLIENT at the start of every round. The
+    // CLIENT overwrites its terrain array directly and never calls
+    // GenerateTerrain() itself. The same approach is used for craters —
+    // TURN_RESULT re-sends the full terrain array after each explosion.
+    //
+    // Wire format
+    // -----------
+    // TCP on port 7890. Each packet:
+    //   [1 byte type | 3 bytes payload-length] [payload bytes...]
+    // All multi-byte integers are sent in network byte order (big-endian).
+    // =========================================================================
 
-    // Send a framed packet: 4-byte header [1 type | 3 length] + payload
+    // Frame and transmit one packet over the TCP connection.
+    // Header packs the message type (top byte) and payload length (24 bits)
+    // into a single uint32 sent in network byte order.
     void NetSend(NetMsg type, const std::vector<uint8_t>& payload) {
         if (remoteSock == INVALID_SOCK) return;
         uint32_t header = htonl(((uint32_t)type << 24) | (uint32_t)payload.size());
@@ -567,9 +611,12 @@ private:
         if (!payload.empty()) send(remoteSock, (const char*)payload.data(), (int)payload.size(), 0);
     }
 
-    // Drain socket into recvBuf, then extract all complete packets
+    // Called every frame during active gameplay.
+    // Uses non-blocking I/O: recv() returns immediately whether or not data is
+    // waiting. Incoming bytes accumulate in recvBuf; complete packets are
+    // extracted and dispatched to NetHandleMessage() one at a time.
     void NetUpdate() {
-        // Accept pending connections (host, waiting phase)
+        // HOST: check for a new incoming connection (lobby waiting phase)
         if (netMode == NetMode::HOST && listenSock != INVALID_SOCK && remoteSock == INVALID_SOCK) {
             sockaddr_in ca{}; socklen_t cl = sizeof(ca);
             SocketHandle c = accept(listenSock, (sockaddr*)&ca, &cl);
@@ -581,30 +628,33 @@ private:
         }
         if (remoteSock == INVALID_SOCK) return;
 
-        // Client: send our name to the host the first time we're connected
+        // CLIENT: first time connected, immediately tell the host our display name
+        // so the host can include it in MATCH_START and both screens show both names
         if (netMode == NetMode::CLIENT && netConnected && !netNameSent) {
             NetBuf b; b.writeStr(settings.playerNames[1]);
             NetSend(NetMsg::PLAYER_NAME, b.data);
             netNameSent = true;
         }
 
+        // Drain whatever bytes the OS has buffered into our stream buffer
         char chunk[4096];
         int n = recv(remoteSock, chunk, sizeof(chunk), 0);
         if (n > 0) {
             recvBuf.insert(recvBuf.end(), chunk, chunk + n);
         } else if (n == 0) {
-            NetClose();
-            return;
+            NetClose(); return;  // graceful disconnect
         } else if (n < 0 && !WouldBlock()) {
-            NetClose();
-            return;
+            NetClose(); return;  // error
         }
 
+        // Extract all complete packets from the stream buffer.
+        // TCP can deliver multiple packets in one recv() call, or split a single
+        // packet across multiple calls — the buffer handles both cases.
         while (recvBuf.size() >= 4) {
             uint32_t hdr; memcpy(&hdr, recvBuf.data(), 4); hdr = ntohl(hdr);
             NetMsg type = (NetMsg)(hdr >> 24);
             uint32_t plen = hdr & 0xFFFFFF;
-            if (recvBuf.size() < 4 + plen) break;
+            if (recvBuf.size() < 4 + plen) break;  // packet not yet fully arrived
             std::vector<uint8_t> pkt(recvBuf.begin() + 4, recvBuf.begin() + 4 + plen);
             recvBuf.erase(recvBuf.begin(), recvBuf.begin() + 4 + plen);
             NetHandleMessage(type, pkt);
@@ -617,6 +667,7 @@ private:
         netConnected = false;
     }
 
+    // HOST: bind and listen on NET_PORT. Sets localPlayer = 0 (HOST is always P1).
     bool NetStartHost() {
         listenSock = socket(AF_INET, SOCK_STREAM, 0);
         if (listenSock == INVALID_SOCK) return false;
@@ -630,6 +681,7 @@ private:
         return true;
     }
 
+    // CLIENT: connect to the host's IP on NET_PORT. Sets localPlayer = 1 (CLIENT is always P2).
     bool NetConnectToHost(const std::string& ip) {
         remoteSock = socket(AF_INET, SOCK_STREAM, 0);
         if (remoteSock == INVALID_SOCK) return false;
@@ -644,10 +696,15 @@ private:
         return true;
     }
 
+    // Returns true when it is this machine's player's turn to act
     bool IsLocalTurn() const { return netMode == NetMode::NONE || currentPlayer == localPlayer; }
 
     // ---- Message builders ---------------------------------------------------
+    // Each function serialises a specific message payload into a NetBuf and
+    // calls NetSend(). All values use network byte order (big-endian).
 
+    // Sent once by HOST after both players have connected.
+    // Contains all match configuration so the CLIENT uses identical settings.
     void NetSendMatchStart() {
         NetBuf b;
         b.writeStr(settings.playerNames[0]); b.writeStr(settings.playerNames[1]);
@@ -660,25 +717,39 @@ private:
         NetSend(NetMsg::MATCH_START, b.data);
     }
 
+    // Sent by HOST at the start of every round.
+    // The full terrain array (800 floats, ~3 KB) is sent rather than a seed
+    // because rand() is not guaranteed to produce the same sequence on different
+    // platforms/compilers, so both machines would diverge with the same seed.
     void NetSendRoundStart() {
         NetBuf b;
         b.writeI32(roundNumber);
-        for (float h : terrain) b.writeF32(h);
+        for (float h : terrain) b.writeF32(h);  // 800 × 4 bytes = 3,200 bytes
         for (int i = 0; i < 2; i++) { b.writeF32(tanks[i].x); b.writeF32(tanks[i].y); }
         b.writeF32(wind); b.writeF32(activeGravity);
         NetSend(NetMsg::ROUND_START, b.data);
     }
 
+    // Sent by the ACTING PLAYER when they commit their turn (fire / skip / surrender).
+    // Received by the other machine which applies the same action locally so
+    // both simulations start from exactly the same state at the same moment.
     void NetSendTurnAction(bool skip, bool surrender) {
         NetBuf b;
         Tank& t = tanks[currentPlayer];
-        b.writeI32((int32_t)t.x);
-        b.writeU8((uint8_t)selectedWeapon);
-        b.writeI32(t.angle); b.writeI32(t.power);
-        b.writeU8(skip ? 1 : 0); b.writeU8(surrender ? 1 : 0);
+        b.writeI32((int32_t)t.x);          // final tank X after all movement this turn
+        b.writeU8((uint8_t)selectedWeapon); // weapon type (affects Fire() behaviour)
+        b.writeI32(t.angle);               // barrel angle  (0 = toward enemy, 90 = up)
+        b.writeI32(t.power);               // firing power  (5–100)
+        b.writeU8(skip ? 1 : 0);
+        b.writeU8(surrender ? 1 : 0);
         NetSend(NetMsg::TURN_ACTION, b.data);
     }
 
+    // Sent by HOST at the end of EVERY turn (hit, miss, skip, laser).
+    // This is the single authoritative sync point: the CLIENT applies this
+    // snapshot and snaps to the HOST's ground truth before the next turn begins.
+    // Terrain is re-sent in full after every explosion so crater damage stays
+    // pixel-identical on both machines.
     void NetSendTurnResult() {
         NetBuf b;
         for (int i = 0; i < 2; i++) {
@@ -688,18 +759,23 @@ private:
             b.writeU8((uint8_t)tanks[i].ammoLaser); b.writeU8((uint8_t)tanks[i].ammoBallistics);
             b.writeU8((uint8_t)tanks[i].ammoShield);
         }
-        for (float h : terrain) b.writeF32(h);
+        for (float h : terrain) b.writeF32(h);  // terrain after any crater carved this turn
         b.writeU8(pickup.active ? 1 : 0);
         if (pickup.active) { b.writeF32(pickup.x); b.writeF32(pickup.y); b.writeU8((uint8_t)pickup.type); }
-        b.writeF32(wind);
+        b.writeF32(wind);  // wind value for the next turn
         NetSend(NetMsg::TURN_RESULT, b.data);
     }
 
     // ---- Message handlers ---------------------------------------------------
+    // Dispatched from NetUpdate() whenever a complete packet is extracted from
+    // the TCP stream buffer.
 
     void NetHandleMessage(NetMsg type, const std::vector<uint8_t>& pkt) {
         NetReader r{pkt.data()};
         switch (type) {
+
+        // CLIENT receives: copy all settings from the HOST so both machines run
+        // with identical configuration for the whole match.
         case NetMsg::MATCH_START: {
             settings.playerNames[0] = r.readStr(); settings.playerNames[1] = r.readStr();
             settings.windSetting = r.readU8(); settings.gravitySetting = r.readU8();
@@ -708,10 +784,12 @@ private:
             settings.startAmmoHE = r.readU8(); settings.startAmmoCluster = r.readU8();
             settings.startAmmoLaser = r.readU8(); settings.startAmmoBallistics = r.readU8();
             settings.startAmmoShield = r.readU8();
-            // Reset match-level state on the client
             tanks[0].score = 0; tanks[1].score = 0;
             break;
         }
+
+        // CLIENT receives: overwrite local terrain with the HOST's exact array
+        // (avoids platform rand() divergence), then initialise all round state.
         case NetMsg::ROUND_START: {
             roundNumber = r.readI32();
             terrain.resize(SCREEN_W);
@@ -721,7 +799,6 @@ private:
             for (int i = 0; i < 2; i++) { tanks[i].x = r.readF32(); tanks[i].y = r.readF32(); }
             wind = r.readF32(); activeGravity = r.readF32();
 
-            // Initialise tank stats from the synced match settings
             for (int i = 0; i < 2; i++) {
                 tanks[i].hp = settings.startingHP;
                 tanks[i].movesLeft = settings.moveBudget;
@@ -736,7 +813,6 @@ private:
             tanks[0].colour = olc::Pixel(60,140,60);  tanks[0].barrelColour = olc::Pixel(40,100,40);
             tanks[1].colour = olc::Pixel(160,60,60);  tanks[1].barrelColour = olc::Pixel(120,40,40);
 
-            // Reset all round state
             projectiles.clear(); explosions.clear(); laserTrail.clear();
             selectedWeapon = WeaponType::NORMAL; reticleActive = false;
             currentPlayer = 0; inputMode = InputMode::NONE; inputBuffer.clear();
@@ -747,6 +823,11 @@ private:
             state = GameState::AIM; stateTimer = 0;
             break;
         }
+
+        // REMOTE machine receives the acting player's committed action.
+        // The remote applies the final position, angle, power and weapon then
+        // calls Fire() (or handles skip/surrender). Both machines now run the
+        // exact same physics from the same starting state — simultaneous fire.
         case NetMsg::TURN_ACTION: {
             int finalX = r.readI32();
             selectedWeapon = (WeaponType)r.readU8();
@@ -766,6 +847,11 @@ private:
             else { Fire(); }  // both machines now fire simultaneously
             break;
         }
+
+        // CLIENT receives: apply the HOST's authoritative end-of-turn snapshot.
+        // Overwrites HP, shields, ammo, scores, terrain and pickup state so any
+        // tiny divergence accumulated during simulation is corrected before the
+        // next turn. Clears waitForResult to unblock the CLIENT state machine.
         case NetMsg::TURN_RESULT: {
             for (int i = 0; i < 2; i++) {
                 tanks[i].hp = r.readI32(); tanks[i].shieldCharges = r.readI32();
@@ -781,7 +867,6 @@ private:
             if (pickup.active) { pickup.x = r.readF32(); pickup.y = r.readF32(); pickup.type = (PickupType)r.readU8(); }
             wind = r.readF32();
             waitForResult = false;
-            // Check win/draw now that canonical state is applied
             if (tanks[0].hp <= 0 || tanks[1].hp <= 0) {
                 bool both = tanks[0].hp <= 0 && tanks[1].hp <= 0;
                 if (both) drawGame = true;
