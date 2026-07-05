@@ -101,9 +101,9 @@ struct NetReader {
 
 // --- Game constants ---------------------------------------------------------
 
-constexpr int SCREEN_W = 800;
-constexpr int SCREEN_H = 600;
-constexpr int UI_HEIGHT = 172;
+constexpr int SCREEN_W = 1024;
+constexpr int SCREEN_H = 768;
+constexpr int UI_HEIGHT = 180;
 constexpr int GAME_TOP = UI_HEIGHT;
 constexpr int GAME_HEIGHT = SCREEN_H - UI_HEIGHT;
 
@@ -156,6 +156,7 @@ struct GameSettings {
     int gravitySetting = 1;    // 0=Light, 1=Medium, 2=Strong, 3=Random
     int landscapeSetting = 2;  // 0=Mountains, 1=Foothills, 2=Random
     int roundsToWin = 3;       // 1, 3, 5, or 7
+    bool nightMode = false;    // darkness + lightning + NVG pickups
 
     // Per-match gameplay values (configurable from the menu)
     int startingHP = 3;         // 1-5
@@ -188,6 +189,9 @@ struct Tank {
 
     // Active shield: 0 = none, 1-3 = remaining protective layers
     int shieldCharges = 0;
+
+    // Night Vision Goggles: turns remaining, 0 = inactive
+    int nvgTurns = 0;
 };
 
 struct Projectile {
@@ -213,7 +217,8 @@ struct Explosion {
 
 enum class PickupType {
     MYSTERY, // random ammo refill for one of the special weapons
-    HEALTH   // +1 HP, capped at settings.startingHP
+    HEALTH,  // +1 HP, capped at settings.startingHP
+    NVG      // night-vision goggles — full visibility for 5 turns (night rounds only)
 };
 
 struct Pickup {
@@ -252,6 +257,17 @@ private:
     float pickupMessageTimer = 0; // counts down while the "what was it" popup shows
     float worldTime = 0;          // unconditional clock for ambient animation (bobbing etc.)
 
+    // -- Night mode --
+    float lightningTimer = 0;              // counts down to next lightning strike
+    float lightningFlash = 0;             // > 0 while the battlefield is lit up post-strike
+    std::vector<olc::vf2d> lightningBolt; // jagged bolt geometry, regenerated each strike
+
+    // -- Screen shake --
+    float shakeTimer = 0;   // > 0 while shaking
+    float shakeMag   = 0;   // starting magnitude in pixels
+    int   shakeOffX  = 0;   // applied camera offset this frame
+    int   shakeOffY  = 0;
+
     // -- Easter egg: name yourself "Daddy" and triple-click during your turn
     // to toggle a perfect trajectory preview line for that tank --
     int cheatClickCount = 0;
@@ -281,6 +297,7 @@ private:
     ma_engine audioEngine;
     std::string explosionWavPath;
     std::string clickWavPath;
+    std::string thunderWavPath;
     ma_sound whistleSound;
     bool whistleSoundLoaded = false; // true while whistleSound is initialised and may need stopping
 
@@ -385,6 +402,41 @@ private:
         }
 
         WriteWavFile(path, samples, sampleRate);
+    }
+
+    // Generate a thunder crack + rolling rumble for lightning strikes (~1.8 s)
+    void GenerateThunderWav(const std::string& path) {
+        int sampleRate = 22050;
+        int numSamples = (int)(sampleRate * 1.8f);
+        std::vector<int16_t> samples(numSamples);
+
+        for (int i = 0; i < numSamples; i++) {
+            float t = (float)i / sampleRate;
+
+            // Sharp initial crack — broadband noise, very fast decay
+            float crackDecay = exp(-t * 60.0f);
+            float crack = ((float)(rand() % 65536) - 32768.0f) / 32768.0f * crackDecay;
+
+            // Rolling rumble — low-frequency noise, long slow decay
+            float rumbleDecay = exp(-t * 1.8f);
+            float rumble = sin(t * 55.0f  * 2.0f * 3.14159f) * 0.4f
+                         + sin(t * 38.0f  * 2.0f * 3.14159f) * 0.3f
+                         + sin(t * 22.0f  * 2.0f * 3.14159f) * 0.3f;
+            rumble *= rumbleDecay;
+
+            // Light noise texture over the rumble
+            float noiseDecay = exp(-t * 2.5f);
+            float noise = ((float)(rand() % 2000) - 1000.0f) / 1000.0f * noiseDecay * 0.2f;
+
+            float sample = crack * 0.6f + rumble * 0.55f + noise;
+            samples[i] = (int16_t)(std::clamp(sample, -1.0f, 1.0f) * 28000);
+        }
+
+        WriteWavFile(path, samples, sampleRate);
+    }
+
+    void PlayThunderSound() {
+        ma_engine_play_sound(&audioEngine, thunderWavPath.c_str(), NULL);
     }
 
     // Generate a whistling shell WAV: pitch rises from launch to apex, then falls
@@ -728,6 +780,7 @@ private:
         b.writeU8((uint8_t)settings.startAmmoHE); b.writeU8((uint8_t)settings.startAmmoCluster);
         b.writeU8((uint8_t)settings.startAmmoLaser); b.writeU8((uint8_t)settings.startAmmoBallistics);
         b.writeU8((uint8_t)settings.startAmmoShield);
+        b.writeU8(settings.nightMode ? 1 : 0);
         NetSend(NetMsg::MATCH_START, b.data);
     }
 
@@ -780,7 +833,7 @@ private:
 
         NetBuf b;
         for (int i = 0; i < 2; i++) {
-            b.writeI32(tanks[i].hp); b.writeI32(tanks[i].shieldCharges);
+            b.writeI32(tanks[i].hp); b.writeI32(tanks[i].shieldCharges); b.writeI32(tanks[i].nvgTurns);
             b.writeI32(tanks[i].score);
             b.writeU8((uint8_t)tanks[i].ammoHE); b.writeU8((uint8_t)tanks[i].ammoCluster);
             b.writeU8((uint8_t)tanks[i].ammoLaser); b.writeU8((uint8_t)tanks[i].ammoBallistics);
@@ -811,6 +864,7 @@ private:
             settings.startAmmoHE = r.readU8(); settings.startAmmoCluster = r.readU8();
             settings.startAmmoLaser = r.readU8(); settings.startAmmoBallistics = r.readU8();
             settings.startAmmoShield = r.readU8();
+            settings.nightMode = (r.readU8() != 0);
             tanks[0].score = 0; tanks[1].score = 0;
             break;
         }
@@ -906,7 +960,7 @@ private:
             }
             // Apply the snapshot
             for (int i = 0; i < 2; i++) {
-                tanks[i].hp = r.readI32(); tanks[i].shieldCharges = r.readI32();
+                tanks[i].hp = r.readI32(); tanks[i].shieldCharges = r.readI32(); tanks[i].nvgTurns = r.readI32();
                 tanks[i].score = r.readI32();
                 tanks[i].ammoHE = r.readU8(); tanks[i].ammoCluster = r.readU8();
                 tanks[i].ammoLaser = r.readU8(); tanks[i].ammoBallistics = r.readU8();
@@ -984,6 +1038,9 @@ private:
         clickWavPath = GetTempFilePath("tanx_click.wav");
         GenerateClickWav(clickWavPath);
 
+        thunderWavPath = GetTempFilePath("tanx_thunder.wav");
+        GenerateThunderWav(thunderWavPath);
+
         return true;
     }
 
@@ -1018,12 +1075,17 @@ private:
             tanks[i].hp = settings.startingHP;
             tanks[i].movesLeft = settings.moveBudget;
             tanks[i].shieldCharges = 0;
+            tanks[i].nvgTurns = 0;
         }
 
         tanks[0].colour = olc::Pixel(60, 140, 60);
         tanks[0].barrelColour = olc::Pixel(40, 100, 40);
         tanks[1].colour = olc::Pixel(160, 60, 60);
         tanks[1].barrelColour = olc::Pixel(120, 40, 40);
+
+        // Night mode: reset lightning timers
+        lightningTimer = 5.0f + (rand() % 5);  // first strike after 5-10 s
+        lightningFlash = 0;
 
         projectiles.clear();
         explosions.clear();
@@ -1221,10 +1283,14 @@ private:
         pickup.x = (float)x;
         pickup.y = terrain[x];
 
-        // Health boxes only enter the pool once someone is in real danger —
-        // otherwise every pickup is the mystery box
+        // In night mode NVG goggles can also spawn (when neither tank already has them)
         bool tankCritical = (tanks[0].hp <= 1 || tanks[1].hp <= 1);
-        pickup.type = (tankCritical && rand() % 2 == 0) ? PickupType::HEALTH : PickupType::MYSTERY;
+        bool nvgAvailable = settings.nightMode && tanks[0].nvgTurns == 0 && tanks[1].nvgTurns == 0;
+
+        int roll = rand() % 10;
+        if (nvgAvailable && roll < 3)           pickup.type = PickupType::NVG;
+        else if (tankCritical && roll < 5)      pickup.type = PickupType::HEALTH;
+        else                                    pickup.type = PickupType::MYSTERY;
         pickup.active = true;
     }
 
@@ -1240,6 +1306,12 @@ private:
             default: t.ammoShield++; name = "SHIELD"; break;
         }
         ShowPickupMessage(settings.playerNames[tankIdx] + " found +1 " + name + " AMMO!");
+    }
+
+    // NVG pickup grants 5 turns of full night-vision to the collecting tank
+    void CollectNVGPickup(int tankIdx) {
+        tanks[tankIdx].nvgTurns = 5;
+        ShowPickupMessage(settings.playerNames[tankIdx] + " found NIGHT VISION GOGGLES! (5 turns)");
     }
 
     // Health pickup grants +1 HP, capped at settings.startingHP
@@ -1260,10 +1332,9 @@ private:
         for (int i = 0; i < 2; i++) {
             if (tanks[i].hp <= 0) continue;
             if (std::abs(tanks[i].x - pickup.x) < TANK_WIDTH / 2.0f + 10.0f) {
-                if (pickup.type == PickupType::MYSTERY)
-                    CollectMysteryPickup(i);
-                else
-                    CollectHealthPickup(i);
+                if (pickup.type == PickupType::MYSTERY)      CollectMysteryPickup(i);
+                else if (pickup.type == PickupType::HEALTH)  CollectHealthPickup(i);
+                else                                         CollectNVGPickup(i);
 
                 pickup.active = false;
                 pickupRespawnTimer = 6.0f + (float)(rand() % 8); // next one in 6-13s
@@ -1515,15 +1586,33 @@ private:
 
     // Apply a direct hit to a tank: absorbed by an active shield if present,
     // otherwise reduces HP. Returns true if the shield absorbed the hit.
+    // Trigger a camera shake — larger magnitude for HE hits, smaller for shield
+    void TriggerShake(float magnitude = 8.0f, float duration = 0.35f) {
+        shakeMag  = magnitude;
+        shakeTimer = duration;
+    }
+
+    // Call once per frame to advance the shake and compute this frame's offset
+    void UpdateShake(float dt) {
+        if (shakeTimer <= 0) { shakeOffX = shakeOffY = 0; return; }
+        shakeTimer -= dt;
+        float intensity = (shakeTimer / 0.35f) * shakeMag;
+        shakeOffX = (int)(((rand() % 2001) - 1000) / 1000.0f * intensity);
+        shakeOffY = (int)(((rand() % 2001) - 1000) / 1000.0f * intensity * 0.6f);
+        if (shakeTimer <= 0) { shakeOffX = shakeOffY = 0; }
+    }
+
     bool ApplyHitDamage(int tankIdx) {
         Tank& t = tanks[tankIdx];
         if (t.shieldCharges > 0) {
             t.shieldCharges--;
             ShowPickupMessage(settings.playerNames[tankIdx] + "'s shield absorbs the hit!");
+            TriggerShake(4.0f, 0.2f); // smaller shake for shield block
             return true;
         }
         t.hp--;
         turnsSinceHit = 0; // a hit happened — reset the stalemate counter
+        TriggerShake(10.0f, 0.4f); // strong shake for a real hit
         return false;
     }
 
@@ -1675,220 +1764,215 @@ private:
     // =========================================================================
 
     void DrawMenuScreen() {
-        // Full-screen wood background
         DrawWoodPanel(0, 0, SCREEN_W, SCREEN_H);
 
+        // ── Layout constants ─────────────────────────────────────────────────
+        const int margin  = 22;
+        const int colGap  = 18;
+        const int colW    = (SCREEN_W - margin * 2 - colGap * 2) / 3; // ~322 px each
+        const int c1 = margin,            c1w = colW;
+        const int c2 = c1 + colW + colGap, c2w = colW;
+        const int c3 = c2 + colW + colGap, c3w = SCREEN_W - margin - c3; // remainder
+
         // Title
-        DrawString(SCREEN_W / 2 - 112, 20, "T A N X", olc::Pixel(255, 200, 0), 4);
+        DrawString(SCREEN_W / 2 - 112, 12, "T A N X", olc::Pixel(255, 200, 0), 4);
 
-        // --- Player name panels ---
-        int nameY = 70;
+        // ── Player name panels (full width, side by side) ───────────────────
+        int nameY = 62;
+        int nameH = 54;
+        int nameW = (SCREEN_W - margin * 2 - colGap) / 2;
         for (int p = 0; p < 2; p++) {
-            int nx = (p == 0) ? 40 : 420;
-            DrawWoodPanel(nx, nameY, 340, 50);
+            int nx = margin + p * (nameW + colGap);
+            DrawWoodPanel(nx, nameY, nameW, nameH);
+            olc::Pixel lc = (p == 0) ? olc::Pixel(100,255,100) : olc::Pixel(255,100,100);
+            DrawString(nx + 10, nameY + 8, (p == 0) ? "Player 1:" : "Player 2:", lc);
 
-            olc::Pixel labelCol = (p == 0) ? olc::Pixel(100, 255, 100) : olc::Pixel(255, 100, 100);
-            std::string header = (p == 0) ? "Player 1:" : "Player 2:";
-            DrawString(nx + 10, nameY + 8, header, labelCol);
-
-            // Name text field
-            int fieldX = nx + 90;
-            int fieldY = nameY + 20;
-            int fieldW = 238;
-            FillRect(fieldX, fieldY, fieldW, 18, olc::Pixel(20, 15, 10));
-            DrawRect(fieldX, fieldY, fieldW, 18, olc::Pixel(80, 60, 30));
-
+            int fx = nx + 100, fy = nameY + 26, fw = nameW - 112;
+            FillRect(fx, fy, fw, 18, olc::Pixel(20,15,10));
+            DrawRect(fx, fy, fw, 18, olc::Pixel(80,60,30));
             if (menuEditingName == p) {
-                // Editing this name - show buffer with cursor
-                DrawRect(fieldX, fieldY, fieldW, 18, olc::Pixel(100, 100, 255));
-                std::string display = menuNameBuffer;
-                if (fmod(menuCursorBlink, 0.8f) < 0.4f) display += "_";
-                DrawString(fieldX + 4, fieldY + 5, display, olc::Pixel(100, 200, 255));
+                DrawRect(fx, fy, fw, 18, olc::Pixel(100,100,255));
+                std::string d = menuNameBuffer;
+                if (fmod(menuCursorBlink, 0.8f) < 0.4f) d += "_";
+                DrawString(fx + 4, fy + 5, d, olc::Pixel(100,200,255));
             } else {
-                DrawString(fieldX + 4, fieldY + 5, settings.playerNames[p], olc::YELLOW);
+                DrawString(fx + 4, fy + 5, settings.playerNames[p], olc::YELLOW);
             }
-
-            // Click on name field to edit
             if (GetMouse(0).bPressed) {
                 int mx = GetMouseX(), my = GetMouseY();
-                if (mx >= fieldX && mx < fieldX + fieldW && my >= fieldY && my < fieldY + 18) {
+                if (mx >= fx && mx < fx+fw && my >= fy && my < fy+18) {
                     if (menuEditingName != -1 && menuEditingName != p) {
-                        // Commit the other name first
                         settings.playerNames[menuEditingName] = menuNameBuffer.empty()
                             ? menuNameBeforeEdit : menuNameBuffer;
                     }
                     menuEditingName = p;
                     menuNameBeforeEdit = settings.playerNames[p];
-                    menuNameBuffer.clear(); // start blank so typing replaces, not appends
+                    menuNameBuffer.clear();
                     menuCursorBlink = 0;
                 }
             }
         }
 
-        // --- Wind panel ---
-        int panelY = 140;
-        DrawWoodPanel(40, panelY, 200, 170);
-        DrawString(50, panelY + 8, "Wind:", olc::Pixel(150, 200, 255), 2);
-        const char* windOpts[] = {"None", "Light", "Medium", "Strong", "Random"};
-        olc::Pixel windCols[] = {olc::WHITE, olc::Pixel(100,255,100), olc::YELLOW,
-                                 olc::Pixel(255,100,100), olc::Pixel(200,150,255)};
-        for (int i = 0; i < 5; i++) {
-            int oy = panelY + 32 + i * 26;
-            if (DrawMenuOption(56, oy, 170, windOpts[i], settings.windSetting == i, windCols[i]))
-                settings.windSetting = i;
+        // ── Three-column settings area ───────────────────────────────────────
+        const int settY = nameY + nameH + 12; // top of the three panels
+
+        // ── Column 1: Wind / Landscape / Night Mode ──────────────────────────
+        {
+            int y = settY;
+            // Wind
+            int wH = 32 + 5 * 28;
+            DrawWoodPanel(c1, y, c1w, wH);
+            DrawString(c1+10, y+8, "Wind:", olc::Pixel(150,200,255), 2);
+            const char* wo[] = {"None","Light","Medium","Strong","Random"};
+            olc::Pixel wc[] = {olc::WHITE, olc::Pixel(100,255,100), olc::YELLOW,
+                               olc::Pixel(255,100,100), olc::Pixel(200,150,255)};
+            for (int i=0;i<5;i++) {
+                int oy = y+30+i*28;
+                if (DrawMenuOption(c1+8, oy, c1w-14, wo[i], settings.windSetting==i, wc[i]))
+                    settings.windSetting = i;
+            }
+            y += wH + 10;
+
+            // Landscape
+            int lH = 32 + 3 * 28;
+            DrawWoodPanel(c1, y, c1w, lH);
+            DrawString(c1+10, y+8, "Landscape:", olc::Pixel(150,255,150), 2);
+            const char* lo[] = {"Mountains","Foothills","Random"};
+            for (int i=0;i<3;i++) {
+                int oy = y+30+i*28;
+                if (DrawMenuOption(c1+8, oy, c1w-14, lo[i], settings.landscapeSetting==i))
+                    settings.landscapeSetting = i;
+            }
+            y += lH + 10;
+
+            // Night mode toggle
+            DrawWoodPanel(c1, y, c1w, 30);
+            if (DrawMenuOption(c1+8, y+8, c1w-14, "Night Mode",
+                    settings.nightMode, olc::Pixel(80,180,255)))
+                settings.nightMode = !settings.nightMode;
         }
 
-        // --- Landscape panel ---
-        DrawWoodPanel(260, panelY, 240, 120);
-        DrawString(270, panelY + 8, "Landscape:", olc::Pixel(150, 255, 150), 2);
-        const char* landOpts[] = {"Mountains", "Foothills", "Random"};
-        for (int i = 0; i < 3; i++) {
-            int oy = panelY + 32 + i * 26;
-            if (DrawMenuOption(276, oy, 210, landOpts[i], settings.landscapeSetting == i))
-                settings.landscapeSetting = i;
-        }
+        // ── Column 2: Gravity / Rounds to Win ────────────────────────────────
+        {
+            int y = settY;
+            int gH = 32 + 4 * 28;
+            DrawWoodPanel(c2, y, c2w, gH);
+            DrawString(c2+10, y+8, "Gravity:", olc::Pixel(255,200,100), 2);
+            const char* go[] = {"Light","Medium","Strong","Random"};
+            olc::Pixel gc[] = {olc::Pixel(100,255,100), olc::YELLOW,
+                               olc::Pixel(255,100,100), olc::Pixel(200,150,255)};
+            for (int i=0;i<4;i++) {
+                int oy = y+30+i*28;
+                if (DrawMenuOption(c2+8, oy, c2w-14, go[i], settings.gravitySetting==i, gc[i]))
+                    settings.gravitySetting = i;
+            }
+            y += gH + 10;
 
-        // --- Gravity panel ---
-        int gravY = panelY + 138;
-        DrawWoodPanel(260, gravY, 240, 145);
-        DrawString(270, gravY + 8, "Gravity:", olc::Pixel(255, 200, 100), 2);
-        const char* gravOpts[] = {"Light", "Medium", "Strong", "Random"};
-        olc::Pixel gravCols[] = {olc::Pixel(100,255,100), olc::YELLOW,
-                                 olc::Pixel(255,100,100), olc::Pixel(200,150,255)};
-        for (int i = 0; i < 4; i++) {
-            int oy = gravY + 32 + i * 26;
-            if (DrawMenuOption(276, oy, 210, gravOpts[i], settings.gravitySetting == i, gravCols[i]))
-                settings.gravitySetting = i;
-        }
-
-        // --- Rounds to win panel ---
-        DrawWoodPanel(520, panelY, 240, 145);
-        DrawString(530, panelY + 8, "Rounds to Win:", olc::Pixel(255, 255, 100), 2);
-        int roundOpts[] = {1, 3, 5, 7};
-        for (int i = 0; i < 4; i++) {
-            int oy = panelY + 32 + i * 26;
-            bool sel = (settings.roundsToWin == roundOpts[i]);
-            if (DrawMenuOption(536, oy, 210, std::to_string(roundOpts[i]), sel, olc::YELLOW)) {
-                settings.roundsToWin = roundOpts[i];
+            int rH = 32 + 4 * 28;
+            DrawWoodPanel(c2, y, c2w, rH);
+            DrawString(c2+10, y+8, "Rounds to Win:", olc::Pixel(255,255,100), 2);
+            int ro[] = {1,3,5,7};
+            for (int i=0;i<4;i++) {
+                int oy = y+30+i*28;
+                if (DrawMenuOption(c2+8, oy, c2w-14, std::to_string(ro[i]),
+                        settings.roundsToWin==ro[i], olc::YELLOW))
+                    settings.roundsToWin = ro[i];
             }
         }
 
-        // --- Game Settings panel (HP, movement, starting ammo) ---
-        int gsY = panelY + 145 + 8;  // just below the Rounds to Win panel
-        int gsH = 131;                // fills to just above the quick guide
-        DrawWoodPanel(520, gsY, 240, gsH);
-        DrawString(530, gsY + 5, "Game Settings:", olc::Pixel(255, 200, 100), 1);
+        // ── Column 3: Game Settings (spinners) ───────────────────────────────
+        {
+            int gsH = 26 + 9 * 20;
+            DrawWoodPanel(c3, settY, c3w, gsH);
+            DrawString(c3+8, settY+6, "Game Settings:", olc::Pixel(255,200,100), 1);
+            int r = settY + 22;
+            DrawMenuSpinner(c3, r, c3w, "Tank HP",    settings.startingHP,         1, 5);             r+=20;
+            DrawMenuSpinner(c3, r, c3w, "Movement",   settings.moveBudget,        10,100,olc::Pixel(150,200,255)); r+=20;
+            DrawMenuSpinner(c3, r, c3w, "HI-EXPLO",   settings.startAmmoHE,        0, 9);             r+=20;
+            DrawMenuSpinner(c3, r, c3w, "Cluster",    settings.startAmmoCluster,   0, 9);             r+=20;
+            DrawMenuSpinner(c3, r, c3w, "Laser",      settings.startAmmoLaser,     0, 9);             r+=20;
+            DrawMenuSpinner(c3, r, c3w, "Ballistic",  settings.startAmmoBallistics,0, 9);             r+=20;
+            DrawMenuSpinner(c3, r, c3w, "Shield",     settings.startAmmoShield,    0, 9);             r+=20;
+        }
 
-        int sRow = gsY + 20;
-        int sW = 228;
-        DrawMenuSpinner(520, sRow,      sW, "Tank HP",     settings.startingHP,         1, 5);       sRow += 16;
-        DrawMenuSpinner(520, sRow,      sW, "Movement",    settings.moveBudget,         10, 100, olc::Pixel(150,200,255)); sRow += 16;
-        DrawMenuSpinner(520, sRow,      sW, "HI-EXPLO",    settings.startAmmoHE,         0, 9);       sRow += 16;
-        DrawMenuSpinner(520, sRow,      sW, "Cluster",     settings.startAmmoCluster,    0, 9);       sRow += 16;
-        DrawMenuSpinner(520, sRow,      sW, "Laser",       settings.startAmmoLaser,      0, 9);       sRow += 16;
-        DrawMenuSpinner(520, sRow,      sW, "Ballistic",   settings.startAmmoBallistics, 0, 9);       sRow += 16;
-        DrawMenuSpinner(520, sRow,      sW, "Shield",      settings.startAmmoShield,     0, 9);
+        // ── Quick guide (full width) ─────────────────────────────────────────
+        // Sits in the space between the panels and the buttons
+        int guideY = SCREEN_H - 160;
+        int guideW = SCREEN_W - margin * 2;
+        DrawWoodPanel(margin, guideY, guideW, 88);
+        DrawString(margin + 10, guideY + 6, "QUICK GUIDE", olc::Pixel(255, 220, 150), 1);
 
-        // --- Quick guide: weapons & pickups primer ---
-        int guideY = gravY + 145 + 9; // just below the gravity panel
-        DrawWoodPanel(40, guideY, 750, 88);
-        DrawString(50, guideY + 6, "QUICK GUIDE - WEAPONS & PICKUPS", olc::Pixel(255, 220, 150), 1);
-
-        int rowY = guideY + 24;
         struct GuideItem { const char* name; const char* desc; };
-        GuideItem items[7] = {
-            {"HI-EXPLO",  "2X RADIUS"},
-            {"CLUSTER",   "SPLITS x3"},
-            {"LASER",     "BEAM SHOT"},
-            {"BALLISTIC", "AUTO-AIM"},
-            {"SHIELD",    "3 LAYERS"},
-            {"MYSTERY",   "RND AMMO"},
-            {"HEALTH",    "+1 HP"},
+        GuideItem items[] = {
+            {"HI-EXPLO","2X RADIUS"}, {"CLUSTER","SPLITS x3"}, {"LASER","BEAM SHOT"},
+            {"BALLISTIC","AUTO-AIM"}, {"SHIELD","3 LAYERS"},
+            {"MYSTERY","RND AMMO"}, {"HEALTH","+1 HP"}, {"NVG","5 TURN VISION"},
         };
-        for (int i = 0; i < 7; i++) {
-            int itemX = 40 + i * 107;
-
+        int numItems = 8;
+        int itemW = guideW / numItems;
+        int rowY = guideY + 24;
+        for (int i = 0; i < numItems; i++) {
+            int ix = margin + i * itemW;
             switch (i) {
                 case 0: case 1: case 2: case 3: case 4:
-                    // HI-EXPLO, CLUSTER, LASER, BALLISTIC, SHIELD — shared art with the HUD weapon boxes
-                    DrawWeaponIcon(i + 1, itemX + 14, rowY + 10, false);
-                    break;
-                case 5: // MYSTERY — question mark
-                    FillCircle(itemX + 14, rowY + 10, 6, olc::Pixel(255, 200, 0));
-                    DrawCircle(itemX + 14, rowY + 10, 6, olc::Pixel(150, 100, 0));
-                    DrawString(itemX + 11, rowY + 6, "?", olc::Pixel(120, 60, 0));
-                    break;
-                case 6: // HEALTH — red cross box
-                    FillRect(itemX + 8, rowY + 4, 12, 12, olc::Pixel(200, 30, 30));
-                    DrawRect(itemX + 8, rowY + 4, 12, 12, olc::WHITE);
-                    FillRect(itemX + 13, rowY + 6, 2, 8, olc::WHITE);
-                    FillRect(itemX + 10, rowY + 9, 8, 2, olc::WHITE);
-                    break;
+                    DrawWeaponIcon(i+1, ix+14, rowY+10, false); break;
+                case 5: // MYSTERY
+                    FillCircle(ix+14, rowY+10, 6, olc::Pixel(255,200,0));
+                    DrawString(ix+11, rowY+6, "?", olc::Pixel(120,60,0)); break;
+                case 6: // HEALTH
+                    FillRect(ix+8, rowY+4, 12,12, olc::Pixel(200,30,30));
+                    DrawRect(ix+8, rowY+4, 12,12, olc::WHITE);
+                    FillRect(ix+13,rowY+6, 2,8, olc::WHITE);
+                    FillRect(ix+10,rowY+9, 8,2, olc::WHITE); break;
+                case 7: // NVG
+                    FillCircle(ix+10, rowY+10, 4, olc::Pixel(0,180,0));
+                    FillCircle(ix+18, rowY+10, 4, olc::Pixel(0,180,0)); break;
             }
-
-            DrawString(itemX + 28, rowY + 4, items[i].name, olc::WHITE);
-            DrawString(itemX + 28, rowY + 16, items[i].desc, olc::Pixel(180, 180, 180));
+            DrawString(ix+28, rowY+3,  items[i].name, olc::WHITE);
+            DrawString(ix+28, rowY+15, items[i].desc, olc::Pixel(170,170,170));
         }
 
-        // --- PLAY (local) + NETWORK GAME buttons ---
-        int btnY = SCREEN_H - 70;
-        int btnH = 44;
-
-        // Local play button (left of centre)
-        int btnX = SCREEN_W / 2 - 180;
-        int btnW = 160;
-
-        // Button shadow
-        FillRect(btnX + 3, btnY + 3, btnW, btnH, olc::Pixel(30, 15, 5));
-
-        // Button body - red gradient
-        for (int y = 0; y < btnH; y++) {
-            float t = (float)y / btnH;
-            int r = (int)(180 - t * 60);
-            int g = (int)(40 - t * 20);
-            int b = (int)(30 - t * 15);
-            DrawLine(btnX, btnY + y, btnX + btnW - 1, btnY + y, olc::Pixel(r, g, b));
-        }
-        DrawRect(btnX, btnY, btnW - 1, btnH - 1, olc::Pixel(220, 100, 60));
-        DrawRect(btnX + 1, btnY + 1, btnW - 3, btnH - 3, olc::Pixel(160, 60, 30));
-
-        // Button text
+        // ── PLAY + NETWORK buttons ───────────────────────────────────────────
+        int btnY = SCREEN_H - 62;
+        int btnH = 48;
+        int btnW = 180;
+        int btnX    = SCREEN_W / 2 - btnW - 16;
+        int netBtnX = SCREEN_W / 2 + 16;
         float pulse = (sin(stateTimer * 3.0f) + 1.0f) * 0.5f;
-        olc::Pixel playCol = olc::Pixel(255, (int)(200 + 55 * pulse), (int)(50 * pulse));
-        DrawString(btnX + 28, btnY + 10, "PLAY!", playCol, 3);
 
-        // Network game button (right of centre)
-        int netBtnX = SCREEN_W / 2 + 20;
-        FillRect(netBtnX + 3, btnY + 3, btnW, btnH, olc::Pixel(20, 30, 50));
-        for (int y = 0; y < btnH; y++) {
-            float t = (float)y / btnH;
-            DrawLine(netBtnX, btnY + y, netBtnX + btnW - 1, btnY + y,
-                olc::Pixel((int)(30-t*10), (int)(80-t*30), (int)(140-t*40)));
-        }
-        DrawRect(netBtnX, btnY, btnW - 1, btnH - 1, olc::Pixel(60, 140, 220));
-        DrawRect(netBtnX + 1, btnY + 1, btnW - 3, btnH - 3, olc::Pixel(40, 100, 180));
-        DrawString(netBtnX + 8, btnY + 10, "NETWORK", olc::Pixel(150, 220, 255), 3);
+        auto drawBtn = [&](int bx, int by, int bw, int bh,
+                           olc::Pixel top, olc::Pixel bot, olc::Pixel border) {
+            FillRect(bx+3, by+3, bw, bh, olc::Pixel(20,10,5));
+            for (int y=0;y<bh;y++) {
+                float t=(float)y/bh;
+                DrawLine(bx,by+y,bx+bw-1,by+y,
+                    olc::Pixel((int)(top.r+(bot.r-top.r)*t),
+                               (int)(top.g+(bot.g-top.g)*t),
+                               (int)(top.b+(bot.b-top.b)*t)));
+            }
+            DrawRect(bx,by,bw-1,bh-1,border);
+        };
+        drawBtn(btnX, btnY, btnW, btnH,
+                olc::Pixel(180,50,20), olc::Pixel(110,25,10), olc::Pixel(220,100,60));
+        DrawString(btnX+32, btnY+14, "PLAY!", olc::Pixel(255,(int)(200+55*pulse),(int)(50*pulse)), 3);
+
+        drawBtn(netBtnX, btnY, btnW, btnH,
+                olc::Pixel(30,80,160), olc::Pixel(15,45,100), olc::Pixel(60,140,220));
+        DrawString(netBtnX+10, btnY+14, "NETWORK", olc::Pixel(150,220,255), 3);
 
         if (GetMouse(0).bPressed) {
-            int mx = GetMouseX(), my = GetMouseY();
-            // Commit name if editing
-            auto commitName = [&]() {
+            int mx=GetMouseX(), my=GetMouseY();
+            auto commit = [&]() {
                 if (menuEditingName >= 0) {
                     settings.playerNames[menuEditingName] = menuNameBuffer.empty()
                         ? menuNameBeforeEdit : menuNameBuffer;
                     menuEditingName = -1;
                 }
             };
-            if (mx >= btnX && mx < btnX + btnW && my >= btnY && my < btnY + btnH) {
-                commitName();
-                StartNewMatch();
-            }
-            if (mx >= netBtnX && mx < netBtnX + btnW && my >= btnY && my < btnY + btnH) {
-                commitName();
-                netMode = NetMode::NONE;
-                NetClose();
-                state = GameState::LOBBY; stateTimer = 0;
-            }
+            if (mx>=btnX && mx<btnX+btnW && my>=btnY && my<btnY+btnH)
+                { commit(); StartNewMatch(); }
+            if (mx>=netBtnX && mx<netBtnX+btnW && my>=btnY && my<btnY+btnH)
+                { commit(); netMode=NetMode::NONE; NetClose(); state=GameState::LOBBY; stateTimer=0; }
         }
     }
 
@@ -1946,16 +2030,39 @@ private:
     }
 
     void DrawSky() {
-        for (int y = GAME_TOP; y < SCREEN_H; y++) {
-            float t = (float)(y - GAME_TOP) / GAME_HEIGHT;
-            int r = (int)(135 + t * 50);
-            int g = (int)(180 + t * 40);
-            int b = (int)(255 - t * 30);
-            DrawLine(0, y, SCREEN_W, y, olc::Pixel(r, g, b));
+        if (settings.nightMode) {
+            // Dark night gradient with a subtle deep-blue tinge at the top
+            for (int y = GAME_TOP; y < SCREEN_H; y++) {
+                float t = (float)(y - GAME_TOP) / GAME_HEIGHT;
+                DrawLine(0, y, SCREEN_W, y, olc::Pixel((int)(8+t*6), (int)(10+t*12), (int)(28+t*20)));
+            }
+            DrawStars();
+            DrawBackgroundHills();
+        } else {
+            for (int y = GAME_TOP; y < SCREEN_H; y++) {
+                float t = (float)(y - GAME_TOP) / GAME_HEIGHT;
+                int r = (int)(135 + t * 50);
+                int g = (int)(180 + t * 40);
+                int b = (int)(255 - t * 30);
+                DrawLine(0, y, SCREEN_W, y, olc::Pixel(r, g, b));
+            }
+            DrawSun();
+            DrawClouds();
+            DrawBackgroundHills();
         }
-        DrawSun();
-        DrawClouds();
-        DrawBackgroundHills();
+    }
+
+    // Deterministic scattered stars for night mode
+    void DrawStars() {
+        for (int i = 0; i < 80; i++) {
+            // Hash-based positions — same every frame, no persistent state
+            int sx = (i * 173 + 37)  % SCREEN_W;
+            int sy = GAME_TOP + (i * 211 + 19) % (GAME_HEIGHT / 2);
+            uint8_t bright = 120 + (i * 97) % 136;
+            float twinkle = (sin(worldTime * (0.5f + (i % 5) * 0.3f) + i) + 1.0f) * 0.5f;
+            uint8_t a = (uint8_t)(bright * (0.6f + 0.4f * twinkle));
+            Draw(sx, sy, olc::Pixel(a, a, a));
+        }
     }
 
     // Fixed sun in the upper sky with a soft glow
@@ -2067,6 +2174,130 @@ private:
 
     // Damage smoke rising from a tank that is on its last HP.
     // Uses worldTime to animate puffs cycling upward — no extra state needed.
+    // =========================================================================
+    // NIGHT MODE
+    // =========================================================================
+
+    // Tick lightning and return true on the frame a strike starts
+    // Generate a jagged lightning bolt from sky to terrain at a random x position
+    void GenerateLightningBolt() {
+        lightningBolt.clear();
+        float bx = (float)(SCREEN_W / 4 + rand() % (SCREEN_W / 2));
+        float by = (float)GAME_TOP;
+        lightningBolt.push_back({bx, by});
+
+        while (by < SCREEN_H) {
+            bx += (float)((rand() % 60) - 30); // jag left or right
+            bx  = std::clamp(bx, 20.0f, (float)(SCREEN_W - 20));
+            by += 18.0f + (float)(rand() % 20);
+            lightningBolt.push_back({bx, by});
+
+            // Occasionally branch a short secondary bolt
+            if (rand() % 4 == 0 && lightningBolt.size() > 2) {
+                float ex = bx + (float)((rand() % 80) - 40);
+                float ey = by + 30.0f + (float)(rand() % 40);
+                lightningBolt.push_back({bx, by});   // branch start
+                lightningBolt.push_back({ex, ey});   // branch end
+                lightningBolt.push_back({bx, by});   // back to main path
+            }
+        }
+    }
+
+    bool UpdateLightning(float dt) {
+        if (!settings.nightMode) return false;
+        if (lightningFlash > 0) {
+            lightningFlash -= dt;
+            return false;
+        }
+        lightningTimer -= dt;
+        if (lightningTimer <= 0) {
+            lightningFlash = 1.5f;
+            lightningTimer = 5.0f + (float)(rand() % 7); // next strike in 5-12 s
+            GenerateLightningBolt();
+            return true; // this is the strike frame — caller plays thunder sound
+        }
+        return false;
+    }
+
+    // Darkness overlay drawn AFTER all normal rendering.
+    // Each player sees only a circular area around their own tank.
+    // During a lightning flash the entire battlefield is revealed.
+    // If the local player has NVG active, a green tint replaces the darkness.
+    void DrawNightOverlay(int localPlayerIdx) {
+        if (!settings.nightMode) return;
+
+        // Lightning or NVG: full visibility
+        bool nvgActive = (tanks[localPlayerIdx].nvgTurns > 0);
+
+        if (lightningFlash > 0) {
+            // Full-screen white flash in the very first frames of the strike
+            float flashFrac = lightningFlash / 1.5f; // 1=just struck, 0=fading out
+            if (flashFrac > 0.9f) {
+                uint8_t a = (uint8_t)(200 * (flashFrac - 0.9f) / 0.1f);
+                FillRect(0, GAME_TOP, SCREEN_W, GAME_HEIGHT, olc::Pixel(230, 235, 255, a));
+            }
+
+            // Draw the bolt for the first 0.7 s of the flash, with flicker
+            if (lightningFlash > 0.8f && !lightningBolt.empty()) {
+                float boltFrac = (lightningFlash - 0.8f) / 0.7f; // 1→0 over 0.7s
+                float flicker  = (sin(lightningFlash * 40.0f) + 1.0f) * 0.5f;
+                uint8_t coreA  = (uint8_t)(255 * boltFrac * (0.6f + 0.4f * flicker));
+                uint8_t glowA  = (uint8_t)(80  * boltFrac);
+
+                for (size_t i = 1; i < lightningBolt.size(); i++) {
+                    int x0 = (int)lightningBolt[i-1].x, y0 = (int)lightningBolt[i-1].y;
+                    int x1 = (int)lightningBolt[i].x,   y1 = (int)lightningBolt[i].y;
+                    // Wide blue-white glow
+                    for (int o = -2; o <= 2; o++) {
+                        DrawLine(x0+o, y0, x1+o, y1, olc::Pixel(180, 200, 255, glowA));
+                    }
+                    // Bright white core
+                    DrawLine(x0, y0, x1, y1, olc::Pixel(255, 255, 255, coreA));
+                }
+            }
+            return; // battlefield visible — no darkness overlay during flash
+        }
+
+        if (nvgActive) {
+            // Green night-vision tint over the entire battlefield
+            FillRect(0, GAME_TOP, SCREEN_W, GAME_HEIGHT, olc::Pixel(0, 60, 0, 160));
+            return;
+        }
+
+        // Normal darkness: render line by line, leaving a clear circle around own tank
+        const int visRadius = 90;
+        int cx = (int)tanks[localPlayerIdx].x;
+        int cy = (int)(tanks[localPlayerIdx].y - TANK_HEIGHT / 2);
+
+        for (int y = GAME_TOP; y < SCREEN_H; y++) {
+            int dy = y - cy;
+            int clearHalf = 0;
+            if (std::abs(dy) < visRadius)
+                clearHalf = (int)std::sqrt((float)(visRadius * visRadius - dy * dy));
+
+            // Left of the clear zone
+            int leftEdge = cx - clearHalf;
+            if (leftEdge > 0)
+                FillRect(0, y, leftEdge, 1, olc::Pixel(0, 0, 0, 230));
+            // Right of the clear zone
+            int rightEdge = cx + clearHalf;
+            if (rightEdge < SCREEN_W)
+                FillRect(rightEdge, y, SCREEN_W - rightEdge, 1, olc::Pixel(0, 0, 0, 230));
+            // Rows entirely outside the circle
+            if (clearHalf == 0)
+                FillRect(0, y, SCREEN_W, 1, olc::Pixel(0, 0, 0, 230));
+        }
+
+        // Soft glow edge around the visibility circle
+        for (int i = 0; i < 12; i++) {
+            float angle = i * 3.14159f / 6.0f;
+            int ex = cx + (int)(cos(angle) * (visRadius - 1));
+            int ey = cy + (int)(sin(angle) * (visRadius - 1));
+            if (ey >= GAME_TOP && ey < SCREEN_H)
+                Draw(ex, ey, olc::Pixel(40, 40, 40, 120));
+        }
+    }
+
     void DrawSmokeEffect(const Tank& t) {
         if (t.hp != 1) return;
 
@@ -2187,11 +2418,18 @@ private:
             DrawCircle(cx, cy, 9, olc::Pixel(150, 100, 0));
             DrawCircle(cx, cy, 7, olc::Pixel(255, 230, 100));
             DrawString(cx - 4, cy - 5, "?", olc::Pixel(120, 60, 0));
-        } else {
+        } else if (pickup.type == PickupType::HEALTH) {
             FillRect(cx - 7, cy - 7, 14, 14, olc::Pixel(200, 30, 30));
             DrawRect(cx - 7, cy - 7, 14, 14, olc::WHITE);
             FillRect(cx - 1, cy - 5, 2, 10, olc::WHITE);
             FillRect(cx - 5, cy - 1, 10, 2, olc::WHITE);
+        } else { // NVG goggles — two green circles
+            float pulse = (sin(worldTime * 5.0f) + 1.0f) * 0.5f;
+            DrawCircle(cx, cy, 10 + (int)(pulse), olc::Pixel(0, 200, 0, 80));
+            FillCircle(cx - 4, cy, 4, olc::Pixel(0, 180, 0));
+            FillCircle(cx + 4, cy, 4, olc::Pixel(0, 180, 0));
+            FillRect(cx - 1, cy - 1, 2, 2, olc::Pixel(0, 255, 0));
+            DrawString(cx - 12, cy + 7, "NVG", olc::Pixel(0, 220, 0));
         }
     }
 
@@ -2332,7 +2570,7 @@ private:
         if (wind > 0.5f) windStr = ">>> " + std::to_string((int)wind);
         else if (wind < -0.5f) windStr = std::to_string((int)wind) + " <<<";
         else windStr = "CALM";
-        DrawString(midCol + 48, row1, windStr, olc::Pixel(150, 200, 255));
+        DrawString(midCol + 48, row1, windStr, WindColour(std::abs(wind)));
 
         // Round
         DrawString(midCol, row2, "ROUND:", textCol);
@@ -2396,7 +2634,10 @@ private:
         }
 
         // Weapon selector — pick a special for this shot (NORMAL has infinite ammo)
-        int boxW = 123, boxH = 24, gap = 4;
+        // 6 weapon boxes spread across the available width
+        int numBoxes = 6, gap = 6;
+        int boxW = (rightCol - leftCol - (numBoxes - 1) * gap) / numBoxes;
+        int boxH = 24;
         bool canSelect = (state == GameState::AIM && inputMode == InputMode::NONE);
 
         if (DrawWeaponBox(leftCol + 0 * (boxW + gap), row5, boxW, boxH,
@@ -2439,17 +2680,48 @@ private:
     // DRAWING - WIND & AIM INDICATORS
     // =========================================================================
 
+    // Colour grades green → yellow → orange → red as wind strength increases
+    olc::Pixel WindColour(float strength) {
+        float t = std::clamp(strength / 10.0f, 0.0f, 1.0f);
+        int r = (int)(60  + 195 * std::min(1.0f, t * 2.0f));
+        int g = (int)(220 - 160 * std::min(1.0f, t * 1.6f));
+        return olc::Pixel(r, g, 40);
+    }
+
     void DrawWindIndicator() {
         int cx = SCREEN_W / 2;
-        int cy = GAME_TOP + 15;
+        int cy = GAME_TOP + 18;
 
-        if (std::abs(wind) > 0.5f) {
-            int arrowLen = (int)(std::abs(wind) * 3);
-            int dir = wind > 0 ? 1 : -1;
-            DrawLine(cx, cy, cx + arrowLen * dir, cy, olc::Pixel(150, 200, 255));
-            DrawLine(cx + arrowLen * dir, cy, cx + (arrowLen - 5) * dir, cy - 3, olc::Pixel(150, 200, 255));
-            DrawLine(cx + arrowLen * dir, cy, cx + (arrowLen - 5) * dir, cy + 3, olc::Pixel(150, 200, 255));
+        // Dark pill for contrast — arrow sits on top of this
+        FillRect(cx - 72, cy - 9, 144, 18, olc::Pixel(0, 0, 0, 160));
+        DrawRect(cx - 72, cy - 9, 143, 17, olc::Pixel(70, 70, 70, 130));
+
+        if (std::abs(wind) <= 0.5f) {
+            DrawString(cx - 16, cy - 4, "CALM", olc::Pixel(180, 220, 180));
+            return;
         }
+
+        float absWind  = std::abs(wind);
+        int   dir      = wind > 0 ? 1 : -1;
+        int   arrowLen = (int)(absWind * 6);   // up to 60 px at max wind
+        int   headLen  = 9;
+        int   headW    = 6;
+        int   shaftEnd = cx + arrowLen * dir;
+        olc::Pixel col = WindColour(absWind);
+
+        // Thick shaft — 3 pixels tall
+        for (int dy = -1; dy <= 1; dy++)
+            DrawLine(cx, cy + dy, shaftEnd, cy + dy, col);
+
+        // Filled triangular arrowhead
+        for (int i = -headW; i <= headW; i++) {
+            float frac   = 1.0f - (float)std::abs(i) / headW;
+            int   xStart = shaftEnd - (int)(headLen * frac) * dir;
+            DrawLine(xStart, cy + i, shaftEnd, cy + i, col);
+        }
+
+        // Small origin tick so the arrow has a visible base
+        DrawLine(cx, cy - 4, cx, cy + 4, col);
     }
 
     void DrawAimGuide() {
@@ -2842,6 +3114,7 @@ private:
     bool OnUserUpdate(float fElapsedTime) override {
         stateTimer += fElapsedTime;
         frameTime = fElapsedTime;
+        UpdateShake(fElapsedTime);
 
         // --- TITLE SCREEN ---
         if (state == GameState::TITLE) {
@@ -2870,6 +3143,7 @@ private:
 
         // --- PICKUPS: ambient clock, respawn timer, message fade, collisions ---
         worldTime += fElapsedTime;
+        if (UpdateLightning(fElapsedTime)) PlayThunderSound();
         if (pickupMessageTimer > 0) pickupMessageTimer -= fElapsedTime;
         if (!pickup.active && pickupRespawnTimer > 0) {
             pickupRespawnTimer -= fElapsedTime;
@@ -3138,6 +3412,13 @@ private:
                     else
                         ShowPickupMessage(settings.playerNames[currentPlayer] + "'s shield fades away!");
                 }
+                // NVG goggles: count down one turn for the player whose turn is starting
+                if (tanks[currentPlayer].nvgTurns > 0) {
+                    tanks[currentPlayer].nvgTurns--;
+                    if (tanks[currentPlayer].nvgTurns == 0)
+                        ShowPickupMessage(settings.playerNames[currentPlayer] + "'s night vision fades!");
+                }
+
                 // Wind for the next turn:
                 // HOST already computed nextWind in NetSendTurnResult() and the CLIENT
                 // received it via TURN_RESULT — both machines use the same value.
@@ -3168,6 +3449,10 @@ private:
         } // end if (!waitForResult)
 
         // --- RENDER ---
+        // Apply screen shake via the layer offset (whole frame shifts).
+        // The magnitude decays to zero over shakeTimer so there's no abrupt stop.
+        SetLayerOffset(0, (float)shakeOffX, (float)shakeOffY);
+
         Clear(olc::BLACK);
         DrawSky();
         DrawTerrain();
@@ -3191,6 +3476,8 @@ private:
         DrawExplosion();
         DrawLaserBeam();
         DrawWindIndicator();
+        // Night overlay drawn last so it sits on top of everything
+        DrawNightOverlay(netMode == NetMode::NONE ? currentPlayer : localPlayer);
         DrawPickupMessage();
         DrawUI();
 
@@ -3229,6 +3516,9 @@ private:
                 }
             }
         }
+
+        // Reset layer offset so the title/menu screens start from origin next frame
+        SetLayerOffset(0, 0.0f, 0.0f);
 
         return true;
     }
