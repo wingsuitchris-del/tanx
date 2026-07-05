@@ -263,10 +263,11 @@ private:
     std::vector<olc::vf2d> lightningBolt; // jagged bolt geometry, regenerated each strike
 
     // -- Screen shake --
-    float shakeTimer = 0;   // > 0 while shaking
-    float shakeMag   = 0;   // starting magnitude in pixels
-    int   shakeOffX  = 0;   // applied camera offset this frame
+    float shakeTimer = 0;              // > 0 while shaking
+    float shakeMag   = 0;              // starting magnitude in pixels
+    int   shakeOffX  = 0;             // pixel offset applied this frame
     int   shakeOffY  = 0;
+    olc::Sprite* pFrameBuf = nullptr; // full-screen render target; blit with offset
 
     // -- Easter egg: name yourself "Daddy" and triple-click during your turn
     // to toggle a perfect trajectory preview line for that tank --
@@ -1030,6 +1031,7 @@ private:
         stateTimer = 0;
 
         // Cross-platform audio engine (miniaudio) and pre-generated one-shot sounds
+        pFrameBuf = new olc::Sprite(SCREEN_W, SCREEN_H);
         ma_engine_init(NULL, &audioEngine);
 
         explosionWavPath = GetTempFilePath("tanx_explosion.wav");
@@ -3116,25 +3118,21 @@ private:
         frameTime = fElapsedTime;
         UpdateShake(fElapsedTime);
 
-        // --- TITLE SCREEN ---
+        // --- TITLE / MENU / LOBBY: draw directly, no shake needed ---
         if (state == GameState::TITLE) {
+            SetDrawTarget(nullptr);
             DrawTitleScreen();
-            if (GetKey(olc::Key::SPACE).bPressed) {
-                state = GameState::MENU;
-                stateTimer = 0;
-            }
+            if (GetKey(olc::Key::SPACE).bPressed) { state = GameState::MENU; stateTimer = 0; }
             return true;
         }
-
-        // --- MENU SCREEN ---
         if (state == GameState::MENU) {
+            SetDrawTarget(nullptr);
             UpdateMenuInput(fElapsedTime);
             DrawMenuScreen();
             return true;
         }
-
-        // --- LOBBY SCREEN ---
         if (state == GameState::LOBBY) {
+            SetDrawTarget(nullptr);
             NetUpdate();
             UpdateLobbyInput();
             DrawLobbyScreen();
@@ -3449,10 +3447,9 @@ private:
         } // end if (!waitForResult)
 
         // --- RENDER ---
-        // Apply screen shake via the layer offset (whole frame shifts).
-        // The magnitude decays to zero over shakeTimer so there's no abrupt stop.
-        SetLayerOffset(0, (float)shakeOffX, (float)shakeOffY);
-
+        // Redirect all drawing into the frame buffer sprite so we can blit it
+        // back to screen with a pixel offset — that is how screen shake works.
+        SetDrawTarget(pFrameBuf);
         Clear(olc::BLACK);
         DrawSky();
         DrawTerrain();
@@ -3517,8 +3514,12 @@ private:
             }
         }
 
-        // Reset layer offset so the title/menu screens start from origin next frame
-        SetLayerOffset(0, 0.0f, 0.0f);
+        // Restore default draw target then blit the frame buffer to screen.
+        // The shake offset is applied here as a pixel translation so all
+        // draw calls above are shifted uniformly — the correct way to shake.
+        SetDrawTarget(nullptr);
+        Clear(olc::BLACK);
+        DrawSprite(shakeOffX, shakeOffY, pFrameBuf);
 
         return true;
     }
